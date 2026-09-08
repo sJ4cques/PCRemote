@@ -1,0 +1,17 @@
+{
+  "name": "@isisanubis/scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sessions:list": "tsx src/listSessions.ts",
+    "sessions:clean": "tsx src/cleanSessions.ts"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3"
+  }
+}

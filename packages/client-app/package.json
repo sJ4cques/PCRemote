@@ -1,0 +1,36 @@
+{
+  "name": "client-app",
+  "version": "0.1.0",
+  "private": true,
+  "productName": "IsisAnubis Client",
+  "description": "Cliente de escritorio remoto (equipo que controla). Solo macOS.",
+  "main": ".vite/build/main.js",
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "lint": "echo \"No linter configured\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@isisanubis/shared": "workspace:*",
+    "firebase": "^11.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.11.2",
+    "@electron-forge/maker-zip": "^7.11.2",
+    "@electron-forge/plugin-auto-unpack-natives": "^7.11.2",
+    "@electron-forge/plugin-fuses": "^7.11.2",
+    "@electron-forge/plugin-vite": "^7.11.2",
+    "@electron-forge/shared-types": "^7.11.2",
+    "@electron/fuses": "^1.8.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^44.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^8.0.0"
+  }
+}

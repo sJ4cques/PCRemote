@@ -1,0 +1,20 @@
+packages:
+  - "packages/*"
+
+# pnpm 11: el layout por defecto es "isolated" (symlinks a .pnpm).
+# Electron Forge espera node_modules planos, así que forzamos hoisted.
+nodeLinker: hoisted
+shamefullyHoist: true
+
+# Permitir ejecutar los scripts de build de estos paquetes (postinstall).
+allowBuilds:
+  esbuild: true
+  electron: true
+  "@firebase/util": false
+  electron-winstaller: false
+  protobufjs: false
+
+# @electron/rebuild v4+ elimina la subdependencia de git (@electron/node-gyp),
+# permitiendo mantener activo blockExoticSubdeps (protección por defecto de pnpm).
+overrides:
+  "@electron/rebuild": "^4.0.0"
