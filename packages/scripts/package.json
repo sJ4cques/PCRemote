@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "sessions:list": "tsx src/listSessions.ts",
-    "sessions:clean": "tsx src/cleanSessions.ts"
+    "sessions:clean": "tsx src/cleanSessions.ts",
+    "sessions:reset": "tsx src/resetSessions.ts"
   },
   "dependencies": {
     "firebase-admin": "^13.0.0"

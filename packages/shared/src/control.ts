@@ -25,8 +25,29 @@ export type ControlCommand =
   | { kind: "requestDisconnect" }
   | { kind: "healthcheck" };
 
+/** Saludo inicial al abrir el canal de datos (Fase 1: verificar conectividad). */
+export interface HelloPayload {
+  sessionId: string;
+  deviceName: string;
+}
+
 export type DataChannelMessage =
+  | { kind: "hello"; payload: HelloPayload }
   | { kind: "mouse"; payload: MouseAction }
   | { kind: "key"; payload: KeyEvent }
   | { kind: "clipboard"; payload: ClipboardEventData }
   | { kind: "control"; payload: ControlCommand };
+
+/** Codifica una mensaje para enviarlo por el DataChannel (JSON). */
+export function encodeDataChannelMessage(msg: DataChannelMessage): string {
+  return JSON.stringify(msg);
+}
+
+/** Decodifica una mensaje recibido por el DataChannel. Devuelve `null` si no es válido. */
+export function decodeDataChannelMessage(raw: unknown): DataChannelMessage | null {
+  try {
+    return JSON.parse(String(raw)) as DataChannelMessage;
+  } catch {
+    return null;
+  }
+}
