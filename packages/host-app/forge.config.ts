@@ -94,6 +94,11 @@ async function copyNutClosure(buildPath: string): Promise<void> {
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
+    // Los binarios .node de @nut-tree-fork/libnut-* ya vienen precompilados por
+    // plataforma y son compatibles con el ABI de este Electron (verificado en
+    // darwin). Evitamos que @electron/rebuild intente recompilarlos para win32
+    // desde macOS (no hay toolchain de Windows) y conservamos los prebuilt.
+    rebuild: false,
   },
   rebuildConfig: {},
   hooks: {
