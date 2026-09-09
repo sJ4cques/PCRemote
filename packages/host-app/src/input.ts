@@ -4,6 +4,11 @@ import type { DataChannelMessage, KeyEvent, MouseButton } from '@isisanubis/shar
 /** Si está activo, registramos los inputs sin inyectarlos (pruebas/CI). */
 export const FAKE_INPUT = process.argv.includes('--isis-fake-input');
 
+type InputLog = (line: string) => void;
+
+let realMoveCount = 0;
+const MOVE_LOG_EVERY = 25;
+
 const KEY_NAMES: Record<string, string> = {
   Enter: 'Enter',
   Backspace: 'Backspace',
@@ -87,13 +92,19 @@ async function applyKey(event: KeyEvent): Promise<void> {
   }
 }
 
-/** Aplica un mensaje de entrada recibido del cliente (mouse/teclado). */
-export async function handleInputMessage(msg: DataChannelMessage): Promise<void> {
+/** Aplica un mensaje de entrada recibido del cliente (mouse/teclado).
+ *  `log` permite volcar las acciones al log de la app (Windows no tiene consola).
+ *  NOTA: el main debe llamar esto SERIALIZADO (una cola), nunca en paralelo:
+ *  nut-js no es seguro bajo solape y un move entre press/release "rompe" el clic. */
+export async function handleInputMessage(
+  msg: DataChannelMessage,
+  log: InputLog = (line) => console.log(line),
+): Promise<void> {
   if (msg.kind !== 'mouse' && msg.kind !== 'key') {
     return;
   }
   if (FAKE_INPUT) {
-    console.log(`[input] ${msg.kind} ${JSON.stringify(msg.payload)}`);
+    log(`[input] ${msg.kind} ${JSON.stringify(msg.payload)}`);
     return;
   }
   try {
@@ -102,19 +113,26 @@ export async function handleInputMessage(msg: DataChannelMessage): Promise<void>
       switch (a.type) {
         case 'move':
           await mouse.setPosition(new Point(Math.round(a.x), Math.round(a.y)));
-          console.log(`[input] mouse_move real aplicado ${Math.round(a.x)},${Math.round(a.y)}`);
+          realMoveCount += 1;
+          if (realMoveCount % MOVE_LOG_EVERY === 1) {
+            log(`[input] mouse_move aplicado ${Math.round(a.x)},${Math.round(a.y)}`);
+          }
           break;
         case 'down':
           await mouse.pressButton(toButton(a.button));
+          log(`[input] mouse_down ${a.button}@${Math.round(a.x)},${Math.round(a.y)}`);
           break;
         case 'up':
           await mouse.releaseButton(toButton(a.button));
+          log(`[input] mouse_up ${a.button}`);
           break;
         case 'click':
           await mouse.click(toButton(a.button));
+          log(`[input] mouse_click ${a.button}@${Math.round(a.x)},${Math.round(a.y)}`);
           break;
         case 'dblclick':
           await mouse.doubleClick(toButton(a.button));
+          log(`[input] mouse_dblclick ${a.button}@${Math.round(a.x)},${Math.round(a.y)}`);
           break;
         case 'scroll': {
           const steps = Math.max(1, Math.round(Math.abs(a.deltaY || a.deltaX) / 100));
@@ -128,13 +146,15 @@ export async function handleInputMessage(msg: DataChannelMessage): Promise<void>
           } else if (a.deltaX < 0) {
             await mouse.scrollLeft(steps);
           }
+          log(`[input] mouse_scroll dx=${a.deltaX} dy=${a.deltaY}`);
           break;
         }
       }
     } else {
       await applyKey(msg.payload);
+      log(`[input] key ${msg.payload.type} ${msg.payload.key}`);
     }
   } catch (err) {
-    console.error('[input] error inyectando entrada:', err);
+    log(`[input] error inyectando [${msg.kind} ${JSON.stringify(msg.payload)}]: ${String(err)}`);
   }
 }

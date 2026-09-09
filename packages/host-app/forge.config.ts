@@ -94,6 +94,12 @@ async function copyNutClosure(buildPath: string): Promise<void> {
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
+    icon: path.join(__dirname, 'assets', 'icon'),
+    // El icono del tray vive fuera del asar (resources/tray.png): Electron no
+    // garantiza leer imágenes desde dentro del asar para el Tray.
+    extraResource: [
+      path.join(__dirname, 'assets/tray.png'),
+    ],
     // Los binarios .node de @nut-tree-fork/libnut-* ya vienen precompilados por
     // plataforma y son compatibles con el ABI de este Electron (verificado en
     // darwin). Evitamos que @electron/rebuild intente recompilarlos para win32

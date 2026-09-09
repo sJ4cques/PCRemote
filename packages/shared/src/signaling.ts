@@ -1,6 +1,7 @@
 import {
   addDoc,
   collection,
+  deleteField,
   doc,
   getDoc,
   onSnapshot,
@@ -27,7 +28,7 @@ export interface SessionState {
   answer?: RTCSessionDescriptionInit;
 }
 
-export type SessionStatus = "waiting" | "signaling" | "active" | "closed";
+export type SessionStatus = "waiting" | "signaling" | "active" | "closed" | "rejected";
 
 export interface SessionDoc {
   machineCode: string;
@@ -36,13 +37,21 @@ export interface SessionDoc {
   pinProtected: boolean;
   createdAt: number;
   updatedAt: number;
-  /** El host deja de esperar y se cierra a esta hora (ms epoch). */
-  expiresAt: number;
+  /** El host deja de esperar y se cierra a esta hora (ms epoch). Solo modo manual. */
+  expiresAt?: number;
   /** Hash SHA-256 del PIN con el que el host protege la sesión. */
   pinHash?: string;
   /** Offer/answer serializados (JSON string de RTCSessionDescriptionInit). */
   offer?: string;
   answer?: string;
+  /** hostId del host en modo emparejado (en manual coincide con machineCode). */
+  hostId?: string;
+  /** Hash SHA-256 del secreto de emparejamiento (modo emparejado). */
+  tokenHash?: string;
+  /** Token `sha256(secreto)` que escribe el CLIENTE junto a su oferta. */
+  token?: string;
+  /** Motivo por el que el host rechazó la conexión (p. ej. par_token_invalid). */
+  rejected?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +125,12 @@ export interface HostPeerOptions extends PeerHandlers {
   deviceName: string;
   /** PIN opcional. Si se indica, el cliente debe enviarlo para unirse. */
   pin?: string;
+  /**
+   * Secreto de emparejamiento (modo persistente). Si se indica la sesión queda
+   * anclada a `sessions/{code}` (hostId), sin TTL, valida `token = sha256(secret)`
+   * antes de responder y sigue vivo tras terminar. NUNCA se publica en Firestore.
+   */
+  secret?: string;
   /** Tiempo máximo esperando al cliente antes de cerrar la sesión (ms). */
   waitTimeoutMs?: number;
   iceServers?: RTCIceServer[];
@@ -132,6 +147,7 @@ export class HostPeer {
   private readonly code: string;
   private readonly deviceName: string;
   private readonly pin?: string;
+  private readonly secret?: string;
   private readonly waitTimeoutMs: number;
   private readonly iceServers: RTCIceServer[];
   private readonly onStatus: (status: PeerStatus, detail?: string) => void;
@@ -145,7 +161,7 @@ export class HostPeer {
   private sessionRef: DocumentReference<DocumentData>;
   private unsubDoc: Unsubscribe | null = null;
   private unsubCandidates: Unsubscribe | null = null;
-  private hasAnswered = false;
+  private lastOffer?: string;
   private stopped = false;
   private seenCandidates = new Set<string>();
   private waitTimer: ReturnType<typeof setTimeout> | null = null;
@@ -155,6 +171,7 @@ export class HostPeer {
     this.code = options.code;
     this.deviceName = options.deviceName;
     this.pin = options.pin;
+    this.secret = options.secret;
     this.waitTimeoutMs = options.waitTimeoutMs ?? 10 * 60 * 1000;
     this.iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS;
     this.onStatus = options.onStatus;
@@ -168,17 +185,31 @@ export class HostPeer {
     this.onStatus("creating");
 
     const pinHash = this.pin ? await sha256Hex(this.pin) : undefined;
+    const tokenHash = this.secret ? await sha256Hex(this.secret) : undefined;
     const now = Date.now();
-    await setDoc(this.sessionRef, {
-      machineCode: this.code,
-      status: "waiting",
-      deviceName: this.deviceName,
-      pinProtected: Boolean(this.pin),
-      ...(pinHash ? { pinHash } : {}),
-      createdAt: now,
-      updatedAt: now,
-      expiresAt: now + this.waitTimeoutMs,
-    });
+    // merge + delete: la sesión persistente conserva campos ajenos (offer/token
+    // de un intento en curso entre ciclos) y limpia artefactos de sesiones previas.
+    await setDoc(
+      this.sessionRef,
+      {
+        machineCode: this.code,
+        status: "waiting",
+        deviceName: this.deviceName,
+        pinProtected: Boolean(this.pin),
+        ...(pinHash ? { pinHash } : {}),
+        ...(tokenHash ? { tokenHash } : {}),
+        ...(this.secret ? { hostId: this.code } : {}),
+        createdAt: now,
+        updatedAt: now,
+        offer: deleteField(),
+        answer: deleteField(),
+        rejected: deleteField(),
+        ...(this.secret
+          ? {}
+          : { expiresAt: now + this.waitTimeoutMs }),
+      },
+      { merge: true },
+    );
     this.onStatus("waiting", this.code);
 
     this.pc = new RTCPeerConnection({ iceServers: this.iceServers });
@@ -210,11 +241,13 @@ export class HostPeer {
       },
     );
 
-    this.waitTimer = setTimeout(() => {
-      if (!this.stopped && this.pc && this.pc.connectionState !== "connected") {
-        void this.stop("expired");
-      }
-    }, this.waitTimeoutMs);
+    if (!this.secret) {
+      this.waitTimer = setTimeout(() => {
+        if (!this.stopped && this.pc && this.pc.connectionState !== "connected") {
+          void this.stop("expired");
+        }
+      }, this.waitTimeoutMs);
+    }
   }
 
   async stop(detail?: string): Promise<void> {
@@ -233,8 +266,13 @@ export class HostPeer {
     this.unsubCandidates = null;
 
     try {
+      // En modo emparejado la sesión persiste "escuchando" para el próximo
+      // cliente; en modo manual se cierra como hasta ahora.
       await updateDoc(this.sessionRef, {
-        status: "closed",
+        status: this.secret ? "waiting" : "closed",
+        answer: deleteField(),
+        offer: deleteField(),
+        rejected: deleteField(),
         updatedAt: Date.now(),
       });
     } catch {
@@ -306,10 +344,42 @@ export class HostPeer {
     if (!snap.exists()) {
       return;
     }
-    const data = snap.data() as { offer?: string };
-    if (data.offer && !this.hasAnswered) {
-      this.hasAnswered = true;
-      void this.answerOffer(data.offer);
+    const data = snap.data() as { offer?: string; token?: string };
+    if (!data.offer || data.offer === this.lastOffer) {
+      return;
+    }
+    this.lastOffer = data.offer;
+    if (this.secret) {
+      // Modo emparejado: solo contestamos si el cliente prueba identidad.
+      void sha256Hex(this.secret)
+        .then((hash) => {
+          if (!data.token) {
+            return this.reject("pair_token_missing");
+          }
+          if (hash !== data.token) {
+            return this.reject("pair_token_invalid");
+          }
+          return this.answerOffer(data.offer as string);
+        })
+        .catch((err) => {
+          console.error(`[HostPeer/${this.code}] token check error:`, err);
+        });
+      return;
+    }
+    void this.answerOffer(data.offer);
+  }
+
+  /** Marca la sesión como rechazada (sin responder la oferta) y avisa a la UI. */
+  private async reject(reason: string): Promise<void> {
+    this.onStatus("error", reason);
+    try {
+      await updateDoc(this.sessionRef, {
+        status: "rejected",
+        rejected: reason,
+        updatedAt: Date.now(),
+      });
+    } catch (err) {
+      console.error(`[HostPeer/${this.code}] reject error:`, err);
     }
   }
 
@@ -420,6 +490,12 @@ export interface ClientPeerOptions extends PeerHandlers {
   deviceName: string;
   /** PIN enviado por el usuario (vacío si la sesión no lo exige). */
   pin?: string;
+  /**
+   * Secreto de emparejamiento (modo persistente). Si el doc de la sesión exige
+   * token (`tokenHash`), este secreto es obligatorio y se envía como
+   * `token = sha256(secret)` junto a la oferta. Nunca viaja en claro.
+   */
+  secret?: string;
   /** Tiempo máximo de negociación antes de abortar (ms). */
   connectionTimeoutMs?: number;
   iceServers?: RTCIceServer[];
@@ -437,6 +513,7 @@ export class ClientPeer {
   private readonly code: string;
   private readonly deviceName: string;
   private readonly pin?: string;
+  private readonly secret?: string;
   private readonly connectionTimeoutMs: number;
   private readonly iceServers: RTCIceServer[];
   private readonly onStatus: (status: PeerStatus, detail?: string) => void;
@@ -460,6 +537,7 @@ export class ClientPeer {
     this.code = options.code;
     this.deviceName = options.deviceName;
     this.pin = options.pin;
+    this.secret = options.secret;
     this.connectionTimeoutMs = options.connectionTimeoutMs ?? 90 * 1000;
     this.iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS;
     this.onStatus = options.onStatus;
@@ -482,6 +560,13 @@ export class ClientPeer {
     if (data.status === "active") {
       this.onStatus("error", "session_busy");
       return { ok: false, reason: "session_busy" };
+    }
+    if (data.tokenHash) {
+      // Sesión emparejada: exigimos el secreto y lo usamos como prueba de identidad.
+      if (!this.secret) {
+        this.onStatus("error", "pair_required");
+        return { ok: false, reason: "pair_required" };
+      }
     }
     if (data.pinProtected) {
       if (!this.pin) {
@@ -541,10 +626,14 @@ export class ClientPeer {
     try {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-      await updateDoc(this.sessionRef, {
+      const patch: Record<string, unknown> = {
         offer: JSON.stringify(offer),
         updatedAt: Date.now(),
-      });
+      };
+      if (this.secret) {
+        patch.token = await sha256Hex(this.secret);
+      }
+      await updateDoc(this.sessionRef, patch);
     } catch (err) {
       console.error(`[ClientPeer/${this.code}] offer error:`, err);
       this.onStatus("error", "offer_failed");
@@ -652,10 +741,14 @@ export class ClientPeer {
     if (!snap.exists()) {
       return;
     }
-    const data = snap.data() as { answer?: string; status?: string };
+    const data = snap.data() as { answer?: string; status?: string; rejected?: string };
     if (data.answer && !this.answerReceived) {
       this.answerReceived = true;
       void this.setRemoteAnswer(data.answer);
+    }
+    if (data.status === "rejected") {
+      void this.stop(data.rejected || "rejected");
+      return;
     }
     if (data.status === "closed") {
       void this.stop("session_closed");

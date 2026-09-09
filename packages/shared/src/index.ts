@@ -2,6 +2,14 @@ export { firebaseConfig, FIRESTORE_COLLECTION, type FirebaseConfig } from "./con
 export { getFirebaseDb, pingFirestore } from "./firebase";
 export { FirestoreStatus, type FirestoreStatusValue } from "./FirestoreStatus";
 export {
+  generatePairSecret,
+  generateHostId,
+  normalizeKey,
+  tokenFor,
+  type HostConfig,
+  type PairRecord,
+} from "./pairing";
+export {
   generateSessionCode,
   sha256Hex,
   HostPeer,
@@ -23,6 +31,8 @@ export {
   type ClipboardEventData,
   type ControlCommand,
   type HelloPayload,
+  type DisplayInfo,
+  type CursorInfo,
   type DataChannelMessage,
   encodeDataChannelMessage,
   decodeDataChannelMessage,

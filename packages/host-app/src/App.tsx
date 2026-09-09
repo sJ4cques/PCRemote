@@ -4,8 +4,10 @@ import {
   generateSessionCode,
   getFirebaseDb,
   HostPeer,
+  type DataChannelMessage,
   type PeerStatus,
 } from '@isisanubis/shared';
+import type { HostConfigView } from './global';
 
 const STATUS_TOOLTIP: Record<PeerStatus, string> = {
   idle: 'En reposo',
@@ -24,9 +26,13 @@ const ERROR_DETAIL: Record<string, string> = {
   connection_failed: 'Se perdió la conexión con el cliente.',
   expired: 'Se agotó el tiempo de espera.',
   screen_permission: 'Permiso de grabación de pantalla denegado.',
+  pair_token_invalid: 'El secreto de emparejamiento es incorrecto. Revisa el equipo en el cliente.',
+  pair_token_missing: 'El cliente no envió su credencial de emparejamiento.',
+  rejected: 'Conexión rechazada.',
 };
 
 type ScreenMode = 'off' | 'real' | 'simulated';
+type Mode = 'paired' | 'manual';
 
 /** Fuente de video sintética (canvas animado) para pruebas sin permiso. */
 function createSyntheticStream(): MediaStream {
@@ -81,21 +87,387 @@ function createSyntheticAudioTrack(): Promise<MediaStreamTrack> {
 }
 
 const App: React.FC = () => {
+  const pairedAvailable = Boolean(
+    window.isis?.hostId && window.isis?.pairSecret && !window.isis?.manual,
+  );
+  const [mode, setMode] = useState<Mode>(pairedAvailable ? 'paired' : 'manual');
+  const [config, setConfig] = useState<HostConfigView | null>(null);
+  const [secretVisible, setSecretVisible] = useState(false);
   const [deviceName, setDeviceName] = useState('Mi equipo');
   const [pin, setPin] = useState('');
   const [code, setCode] = useState('');
   const [status, setStatus] = useState<PeerStatus>('idle');
   const [detail, setDetail] = useState('');
   const [screenMode, setScreenMode] = useState<ScreenMode>('off');
+  const [captureMode, setCaptureMode] = useState<'legacy' | 'getDisplayMedia' | null>(null);
+  const [captureError, setCaptureError] = useState('');
+  const [restartKey, setRestartKey] = useState(0);
+  const [autostart, setAutostart] = useState(false);
+
   const peerRef = useRef<HostPeer | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-
-  /** Último valor del portapapeles local aplicado (evita ecos al sincronizar). */
+  const deviceNameRef = useRef(deviceName);
   const lastClipboardRef = useRef<string | null>(null);
+  const restartTimerRef = useRef<number | undefined>(undefined);
+  const channelOpenRef = useRef(false);
+  const lastSentCursorRef = useRef<{ x: number; y: number } | null>(null);
+  const displayInfoRef = useRef<{ width: number; height: number } | null>(null);
 
-  /** Sincroniza el portapapeles del host → cliente mientras haya sesión.
-   *  Polling del portapapeles del sistema cada 700 ms; si cambió, se propaga.
-   *  Al conectar se siembra el valor actual para no reenviar contenido previo. */
+  deviceNameRef.current = deviceName;
+
+  const stopScreen = useCallback(() => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    setScreenMode('off');
+  }, []);
+
+  const getScreenStream = useCallback(async (): Promise<MediaStream | null> => {
+    await stopScreen();
+    try {
+      let stream: MediaStream;
+      if (window.isis?.simulateVideo) {
+        stream = createSyntheticStream();
+        setScreenMode('simulated');
+        console.log('[host] screen_mode=simulated');
+      } else {
+        const result = await captureScreenStream();
+        if (!result) {
+          console.error('[host] screen capture failed (los dos métodos de captura)');
+          setScreenMode('off');
+          setCaptureError('Captura de pantalla fallida; revisa el log.');
+          return null;
+        }
+        if (result.stream === null) {
+          console.error(`[host] screen capture failed: ${result.error}`);
+          setScreenMode('off');
+          setCaptureError(`No se pudo capturar la pantalla: ${result.error}`);
+          return null;
+        }
+        const videoCount = result.stream.getVideoTracks().length;
+        if (videoCount === 0) {
+          console.error(
+            `[host] captura sin video tracks (audio=${result.stream.getAudioTracks().length}); abortando`,
+          );
+          result.stream.getTracks().forEach((t) => t.stop());
+          setScreenMode('off');
+          setCaptureError('La captura no devolvió pistas de video.');
+          return null;
+        }
+        stream = result.stream;
+        setCaptureMode(result.mode);
+        setCaptureError('');
+        setScreenMode('real');
+      }
+
+      if (window.isis?.simulateAudio) {
+        const audioTrack = await createSyntheticAudioTrack();
+        stream.addTrack(audioTrack);
+        console.log('[host] stream_audio=simulated');
+      } else {
+        console.log(
+          `[host] stream_audio=${stream.getAudioTracks().length > 0 ? 'real' : 'off'}`,
+        );
+      }
+
+      streamRef.current = stream;
+      return stream;
+    } catch (err) {
+      console.error('[host] screen capture failed:', err);
+      setScreenMode('off');
+      return null;
+    }
+  }, [stopScreen]);
+
+  /**
+   * Captura la pantalla real (Windows/macOS/Linux).
+   *
+   * Orden: 1) getUserMedia legacy con chromeMediaSource (video SOLO; pedir audio
+   * de escritorio en la misma llamada rompe la captura de video en Windows);
+   * 2) si falla, getDisplayMedia (con setDisplayMediaRequestHandler en main).
+   */
+  const captureScreenStream = useCallback(
+    async ():
+      Promise<
+        | { stream: MediaStream; mode: 'legacy' | 'getDisplayMedia' }
+        | { stream: null; error: string }
+      > => {
+    const platform = window.isis?.platform ?? 'darwin';
+    const forceGdm = window.isis?.forceGetDisplayMedia === true;
+    if (!forceGdm) {
+      try {
+        const sourceId = await window.isis!.getScreenSourceId();
+        const chromeSource = platform === 'darwin' ? 'screen' : 'desktop';
+        const constraints = {
+          audio: false,
+          video: {
+            mandatory: {
+              chromeMediaSource: chromeSource,
+              chromeMediaSourceId: sourceId,
+              maxWidth: 1920,
+              maxHeight: 1080,
+              maxFrameRate: 30,
+            },
+          },
+        } as unknown as MediaStreamConstraints;
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        console.log(
+          `[host] capture_result video=${stream.getVideoTracks().length} audio=${stream.getAudioTracks().length} mode=legacy`,
+        );
+        return { stream, mode: 'legacy' };
+      } catch (errLegacy) {
+        console.warn('[host] captura legacy fallida; probando getDisplayMedia:', errLegacy);
+      }
+    }
+    try {
+      const stream = (await navigator.mediaDevices.getDisplayMedia({
+        audio: false,
+        video: { frameRate: { max: 30 } },
+      } as MediaStreamConstraints)) as MediaStream;
+      console.log(
+        `[host] capture_result video=${stream.getVideoTracks().length} audio=${stream.getAudioTracks().length} mode=getDisplayMedia`,
+      );
+      return { stream, mode: 'getDisplayMedia' };
+    } catch (errGdm) {
+      const error = errGdm instanceof Error ? errGdm.message : String(errGdm);
+      console.error('[host] getDisplayMedia fallida:', errGdm);
+      return { stream: null, error };
+    }
+  }, []);
+
+  const statusMessage = useCallback((s: PeerStatus, d?: string) => {
+    console.log(`[host] status=${s}${d ? ` detail=${d}` : ''}`);
+    setStatus(s);
+    setDetail(d ? (ERROR_DETAIL[d] ?? d) : '');
+    window.isis?.setTrayStatus(
+      `${STATUS_TOOLTIP[s]}${d ? ` — ${ERROR_DETAIL[d] ?? d}` : ''}`,
+    );
+    if (s === 'connected') {
+      console.log(`[host] CONNECTED`);
+    }
+  }, []);
+
+  const handleData = useCallback((msg: DataChannelMessage, peer?: HostPeer) => {
+    if (msg.kind === 'hello') {
+      console.log(`[host] peer_hello device=${msg.payload.deviceName}`);
+      setDetail(`Cliente remoto: ${msg.payload.deviceName}`);
+    } else if (msg.kind === 'mouse' || msg.kind === 'key') {
+      window.isis?.sendInput(msg);
+    } else if (msg.kind === 'clipboard') {
+      void window.isis?.writeClipboard(msg.payload.text);
+      lastClipboardRef.current = msg.payload.text;
+      console.log(`[host] clipboard_recv (cliente) len=${msg.payload.text.length}`);
+    } else if (msg.kind === 'control') {
+      console.log(`[host] control ${msg.payload.kind}`);
+      if (msg.payload.kind === 'requestDisconnect') {
+        void (peer ?? peerRef.current)?.stop();
+      }
+    }
+  }, []);
+
+  const onChannelState = useCallback((open: boolean) => {
+    console.log(`[host] channel_state=${open ? 'open' : 'closed'}`);
+    channelOpenRef.current = open;
+    if (open && displayInfoRef.current) {
+      const { width, height } = displayInfoRef.current;
+      peerRef.current?.send({ kind: 'display', payload: { width, height } });
+    }
+  }, []);
+
+  // El host difunde su cursor y la resolución real del escritorio para que el
+  // cliente dibuje el overlay (comportamiento tipo Chrome Remote Desktop).
+  useEffect(() => {
+    window.isis?.watchCursor(true);
+    const unsub = window.isis?.onCursorEvent(({ x, y, width, height }) => {
+      if (
+        !displayInfoRef.current ||
+        displayInfoRef.current.width !== width ||
+        displayInfoRef.current.height !== height
+      ) {
+        displayInfoRef.current = { width, height };
+        if (channelOpenRef.current) {
+          peerRef.current?.send({ kind: 'display', payload: { width, height } });
+        }
+      }
+      if (!channelOpenRef.current) {
+        return;
+      }
+      const last = lastSentCursorRef.current;
+      if (!last || last.x !== x || last.y !== y) {
+        lastSentCursorRef.current = { x, y };
+        if (!last) {
+          console.log(`[host] cursor_stream_inicio ${x},${y}`);
+        }
+        peerRef.current?.send({ kind: 'cursor', payload: { x, y } });
+      }
+    });
+    return () => {
+      unsub?.();
+      window.isis?.watchCursor(false);
+    };
+  }, []);
+
+  // --- Modo manual (sesión temporal por código, flujo previo) --------------
+
+  const startManual = useCallback(
+    (nameArg?: string, pinArg?: string) => {
+      const name = (nameArg ?? 'Mi equipo').trim() || 'Mi equipo';
+      const p = pinArg ?? '';
+      void (async () => {
+        if (peerRef.current) {
+          await peerRef.current.stop();
+          peerRef.current = null;
+        }
+        const newCode = window.isis?.code || generateSessionCode();
+        setCode(newCode);
+        const ttlSec = window.isis?.sessionTtl;
+        const ttlMs =
+          ttlSec !== undefined && ttlSec > 0
+            ? ttlSec * 1000
+            : 10 * 60 * 1000;
+        const peer = new HostPeer({
+          db: getFirebaseDb(),
+          code: newCode,
+          deviceName: name,
+          pin: p || undefined,
+          waitTimeoutMs: ttlMs,
+          getScreenStream,
+          onStatus: (s, d) => statusMessage(s, d),
+          onData: (m) => handleData(m, peer),
+          onChannelState,
+        });
+        peerRef.current = peer;
+        await peer.start();
+        console.log(`[host] manual_session_ready code=${newCode}`);
+      })();
+    },
+    [getScreenStream, statusMessage, handleData, onChannelState],
+  );
+
+  useEffect(() => {
+    if (mode !== 'manual') {
+      return;
+    }
+    void startManual('Mi equipo', window.isis?.pin ?? '');
+    return () => {
+      stopScreen();
+      void peerRef.current?.stop();
+      peerRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  // --- Modo emparejado (servicio): escucha persistente ----------------------
+
+  useEffect(() => {
+    if (mode !== 'paired' || !pairedAvailable) {
+      return;
+    }
+    const hostId = window.isis!.hostId!;
+    const secret = window.isis!.pairSecret!;
+    let cancelled = false;
+    window.clearTimeout(restartTimerRef.current);
+
+    const run = async (): Promise<void> => {
+      if (cancelled) {
+        return;
+      }
+      if (peerRef.current) {
+        await peerRef.current.stop();
+        peerRef.current = null;
+      }
+      const peer = new HostPeer({
+        db: getFirebaseDb(),
+        code: hostId,
+        secret,
+        deviceName: deviceNameRef.current,
+        getScreenStream,
+        onStatus: (s, d) => {
+          statusMessage(s, d);
+          if ((s === 'ended' || s === 'error') && !cancelled) {
+            void peer.stop();
+            if (s === 'error') {
+              console.log('[host] error escuchando, reintentando en 2 s…');
+            }
+            restartTimerRef.current = window.setTimeout(() => {
+              if (!cancelled) {
+                setRestartKey((k) => k + 1);
+              }
+            }, s === 'error' ? 2000 : 1500);
+          }
+        },
+        onData: (m) => handleData(m, peer),
+        onChannelState,
+      });
+      peerRef.current = peer;
+      await peer.start();
+      console.log(`[host] listening hostId=${hostId}`);
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(restartTimerRef.current);
+      void peerRef.current?.stop();
+      peerRef.current = null;
+      stopScreen();
+    };
+  }, [mode, restartKey, pairedAvailable, getScreenStream, statusMessage, handleData, onChannelState, stopScreen]);
+
+  // --- Diagnóstico: `--isis-capture-test` captura al arrancar y loguea ------
+
+  useEffect(() => {
+    if (!window.isis?.captureTest) {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      console.log('[host] capture_test: probando captura de pantalla…');
+      const stream = await getScreenStream();
+      if (cancelled || !stream) {
+        console.log('[host] capture_test: resultado FALLO');
+        return;
+      }
+      console.log(
+        `[host] capture_test OK video=${stream.getVideoTracks().length} audio=${stream.getAudioTracks().length}`,
+      );
+      setTimeout(() => {
+        stream.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+        setScreenMode('off');
+        console.log('[host] capture_test: stream liberado');
+      }, 2000);
+    })();
+    return () => {
+      cancelled = true;
+      stopScreen();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- Config inicial (panel emparejado) ------------------------------------
+
+  useEffect(() => {
+    void (async () => {
+      const cfg = await window.isis?.getConfig();
+      if (cfg) {
+        setConfig(cfg);
+        setDeviceName(cfg.deviceName);
+        setAutostart(cfg.autostart);
+      }
+    })();
+  }, []);
+
+  // Acción desde la bandeja: "Desconectar sesión".
+  useEffect(() => {
+    return window.isis?.onControl((cmd) => {
+      if (cmd === 'requestDisconnect') {
+        void peerRef.current?.stop();
+      }
+    });
+  }, []);
+
+  // --- Portapapeles (sincronización host → cliente) -------------------------
+
   useEffect(() => {
     if (status !== 'connected') {
       return;
@@ -131,190 +503,199 @@ const App: React.FC = () => {
     };
   }, [status]);
 
-  const stopScreen = useCallback(() => {
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    setScreenMode('off');
-  }, []);
-
-  const getScreenStream = useCallback(async (): Promise<MediaStream | null> => {
-    await stopScreen();
-    try {
-      let stream: MediaStream;
-      if (window.isis?.simulateVideo) {
-        stream = createSyntheticStream();
-        setScreenMode('simulated');
-        console.log('[host] screen_mode=simulated');
-      } else {
-        const sourceId = await window.isis!.getScreenSourceId();
-        const constraints = {
-          audio: {
-            mandatory: {
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: sourceId,
-            },
-          },
-          video: {
-            mandatory: {
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: sourceId,
-              maxWidth: 1920,
-              maxHeight: 1080,
-              maxFrameRate: 30,
-            },
-          },
-        } as unknown as MediaStreamConstraints;
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-        setScreenMode('real');
-        console.log('[host] screen_mode=real');
-      }
-
-      if (window.isis?.simulateAudio) {
-        const audioTrack = await createSyntheticAudioTrack();
-        stream.addTrack(audioTrack);
-        console.log('[host] stream_audio=simulated');
-      } else {
-        console.log(
-          `[host] stream_audio=${stream.getAudioTracks().length > 0 ? 'real' : 'off'}`,
-        );
-      }
-
-      streamRef.current = stream;
-      return stream;
-    } catch (err) {
-      console.error('[host] screen capture failed:', err);
-      setScreenMode('off');
-      return null;
-    }
-  }, [stopScreen]);
-
-  const start = useCallback(
-    (nameArg?: string, pinArg?: string) => {
-      const name = (nameArg ?? 'Mi equipo').trim() || 'Mi equipo';
-      const p = pinArg ?? '';
-      void (async () => {
-        if (peerRef.current) {
-          await peerRef.current.stop();
-          peerRef.current = null;
-        }
-        const newCode = generateSessionCode();
-        setCode(newCode);
-        const ttlSec = window.isis?.sessionTtl;
-        const ttlMs =
-          ttlSec !== undefined && ttlSec > 0
-            ? ttlSec * 1000
-            : 10 * 60 * 1000;
-        const peer = new HostPeer({
-          db: getFirebaseDb(),
-          code: newCode,
-          deviceName: name,
-          pin: p || undefined,
-          waitTimeoutMs: ttlMs,
-          getScreenStream,
-          onStatus: (s, d) => {
-            console.log(`[host] status=${s}${d ? ` detail=${d}` : ''}`);
-            setStatus(s);
-            setDetail(d ? (ERROR_DETAIL[d] ?? d) : '');
-            if (s === 'connected') {
-              console.log(`[host] CONNECTED code=${newCode}`);
-            }
-          },
-          onData: (msg) => {
-            if (msg.kind === 'hello') {
-              console.log(`[host] peer_hello device=${msg.payload.deviceName}`);
-              setDetail(`Cliente remoto: ${msg.payload.deviceName}`);
-            } else if (msg.kind === 'mouse' || msg.kind === 'key') {
-              window.isis?.sendInput(msg);
-            } else if (msg.kind === 'clipboard') {
-              void window.isis?.writeClipboard(msg.payload.text);
-              lastClipboardRef.current = msg.payload.text;
-              console.log(`[host] clipboard_recv (cliente) len=${msg.payload.text.length}`);
-            } else if (msg.kind === 'control') {
-              console.log(`[host] control ${msg.payload.kind}`);
-              if (msg.payload.kind === 'requestDisconnect') {
-                void peerRef.current?.stop();
-              }
-            }
-          },
-          onChannelState: (open) => {
-            console.log(`[host] channel_state=${open ? 'open' : 'closed'}`);
-          },
-        });
-        peerRef.current = peer;
-        await peer.start();
-        console.log(`[host] session_ready code=${newCode}`);
-      })();
-    },
-    [getScreenStream],
-  );
-
-  useEffect(() => {
-    const args = window.isis;
-    void start('Mi equipo', args?.pin ?? '');
-    return () => {
-      stopScreen();
-      void peerRef.current?.stop();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [start]);
-
   const stopSession = useCallback(() => {
     void (async () => {
       await peerRef.current?.stop();
       peerRef.current = null;
       stopScreen();
-      setStatus('idle');
       setDetail('');
-      setCode('');
+      if (mode === 'manual') {
+        setStatus('idle');
+        setCode('');
+      }
     })();
-  }, [stopScreen]);
+  }, [mode, stopScreen]);
 
-  const copyCode = useCallback(() => {
-    const text = code;
+  const copyText = useCallback((text: string) => {
     void navigator.clipboard
       ?.writeText(text)
-      .then(() => setDetail('Código copiado'))
+      .then(() => setDetail('Copiado al portapapeles'))
       .catch(() => setDetail('No se pudo copiar automáticamente'));
-  }, [code]);
+  }, []);
+
+  const toggleAutostart = useCallback(() => {
+    void (async () => {
+      const next = !autostart;
+      setAutostart(next);
+      const applied = await window.isis?.setAutostart(next);
+      setAutostart(Boolean(applied));
+      setDetail(next ? 'Inicio con Windows activado' : 'Inicio con Windows desactivado');
+    })();
+  }, [autostart]);
+
+  const regeneratePairing = useCallback(() => {
+    if (!window.confirm('¿Regenerar el emparejamiento? Los equipos guardados con el código actual dejarán de conectar.')) {
+      return;
+    }
+    void (async () => {
+      const next = await window.isis?.regeneratePairing();
+      if (!next) {
+        return;
+      }
+      setConfig((prev) =>
+        prev ? { ...prev, hostId: next.hostId, secret: next.secret } : prev,
+      );
+      setSecretVisible(false);
+      setDetail('Nuevo emparejamiento generado. Pasalo al cliente una sola vez.');
+    })();
+  }, []);
+
+  const toggleService = useCallback(() => {
+    void (async () => {
+      const cfg = await window.isis?.getConfig();
+      const next = !(config?.service ?? cfg?.service ?? false);
+      await window.isis?.setConfig({ service: next });
+      setConfig((prev) => (prev ? { ...prev, service: next } : prev));
+      setDetail(next ? 'Modo servicio activado (se aplicará en el próximo arranque)' : 'Modo servicio desactivado');
+    })();
+  }, [config]);
+
+  const busy = status === 'creating' || status === 'looking_up' || status === 'signaling' || status === 'connecting';
 
   return (
     <div className="app">
       <h1>IsisAnubis Host</h1>
       <p className="muted">Equipo controlado (Windows).</p>
 
-      <div className="form">
-        <label className="field">
-          <span>Nombre del equipo</span>
-          <input
-            value={deviceName}
-            onChange={(e) => setDeviceName(e.target.value)}
-            placeholder="Mi equipo"
-          />
-        </label>
-        <label className="field">
-          <span>PIN (opcional)</span>
-          <input
-            type="password"
-            value={pin}
-            onChange={(e) => setPin(e.target.value)}
-            placeholder="Sin PIN"
-          />
-        </label>
-        <div className="actions">
-          <button type="button" className="btn primary" onClick={() => void start(deviceName, pin)}>
-            Renovar sesión
+      {pairedAvailable && (
+        <div className="mode-tabs">
+          <button
+            type="button"
+            className={`mode-tab ${mode === 'paired' ? 'active' : ''}`}
+            onClick={() => setMode('paired')}
+          >
+            Emparejado
           </button>
-          {code && (
-            <button type="button" className="btn danger" onClick={stopSession}>
-              Detener sesión
-            </button>
-          )}
+          <button
+            type="button"
+            className={`mode-tab ${mode === 'manual' ? 'active' : ''}`}
+            onClick={() => setMode('manual')}
+          >
+            Código
+          </button>
         </div>
-      </div>
+      )}
 
-      {code && (
+      {mode === 'paired' && config && (
+        <>
+          <div className="form">
+            <label className="field">
+              <span>Nombre del equipo</span>
+              <input
+                value={deviceName}
+                onChange={(e) => setDeviceName(e.target.value)}
+                placeholder="Mi equipo"
+              />
+            </label>
+          </div>
+
+          <div className="pairing-block">
+            <p className="muted">Este equipo queda conectable desde el cliente con:</p>
+            <div className="pairing-row">
+              <span>ID del equipo</span>
+              <button type="button" className="pairing-key" onClick={() => copyText(config.hostId)} title="Copiar ID">
+                {config.hostId}
+              </button>
+            </div>
+            <div className="pairing-row">
+              <span>Secreto</span>
+              <button
+                type="button"
+                className="pairing-key"
+                onClick={() => copyText(config.secret)}
+                title="Copiar secreto"
+              >
+                {secretVisible ? config.secret : '••••••••'}
+              </button>
+              <button
+                type="button"
+                className="btn small"
+                onClick={() => setSecretVisible((v) => !v)}
+                title={secretVisible ? 'Ocultar' : 'Mostrar'}
+              >
+                {secretVisible ? 'Ocultar' : 'Mostrar'}
+              </button>
+            </div>
+            <p className="muted">Entrega estos datos al cliente UNA sola vez en "Añadir equipo".</p>
+          </div>
+
+          <div className="actions column">
+            <button type="button" className="btn primary" onClick={() => copyText(`${config.hostId} ${config.secret}`)}>
+              Copiar ID y secreto
+            </button>
+            <button type="button" className="btn" onClick={regeneratePairing}>
+              Regenerar emparejamiento
+            </button>
+            <label className="row-toggle">
+              <input type="checkbox" checked={autostart} onChange={toggleAutostart} />
+              <span>Iniciar automáticamente con la PC</span>
+            </label>
+            <label className="row-toggle">
+              <input type="checkbox" checked={config.service} onChange={toggleService} />
+              <span>Modo servicio (sin ventana)</span>
+            </label>
+            <div className="actions">
+              <button type="button" className="btn" onClick={() => window.isis?.hideWindow()}>
+                Ocultar ventana
+              </button>
+              <button
+                type="button"
+                className="btn danger"
+                onClick={stopSession}
+                title="Desconectar al cliente actual (el host sigue escuchando)"
+              >
+                Desconectar cliente
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {mode === 'manual' && (
+        <div className="form">
+          <label className="field">
+            <span>Nombre del equipo</span>
+            <input
+              value={deviceName}
+              onChange={(e) => setDeviceName(e.target.value)}
+              placeholder="Mi equipo"
+            />
+          </label>
+          <label className="field">
+            <span>PIN (opcional)</span>
+            <input
+              type="password"
+              value={pin}
+              onChange={(e) => setPin(e.target.value)}
+              placeholder="Sin PIN"
+            />
+          </label>
+          <div className="actions">
+            <button type="button" className="btn primary" onClick={() => void startManual(deviceName, pin)}>
+              Renovar sesión
+            </button>
+            {code && (
+              <button type="button" className="btn danger" onClick={stopSession}>
+                Detener sesión
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {mode === 'manual' && code && (
         <div className="code-block">
-          <button type="button" className="session-code" onClick={copyCode} title="Copiar código">
+          <button type="button" className="session-code" onClick={() => copyText(code)} title="Copiar código">
             {code}
           </button>
           <p className="muted">Entregá este código al cliente (clic para copiar)</p>
@@ -334,10 +715,12 @@ const App: React.FC = () => {
 
       <p className="muted">
         {screenMode === 'real'
-          ? 'Trasmitiendo pantalla real'
+          ? `Trasmitiendo pantalla real (${captureMode ?? '?'})`
           : screenMode === 'simulated'
             ? 'Trasmitiendo video sintético (prueba)'
-            : 'Pantalla: sin transmitir (esperando cliente)'}
+            : captureError
+              ? `Pantalla: ${captureError}`
+              : 'Pantalla: sin transmitir (esperando cliente)'}
       </p>
 
       <p className="muted">
@@ -345,7 +728,7 @@ const App: React.FC = () => {
       </p>
 
       <p className="muted">
-        Audio: {window.isis?.simulateAudio ? 'tono sintético (prueba)' : 'audio del sistema'}
+        Audio: {window.isis?.simulateAudio ? 'tono sintético (prueba)' : 'no transmitido'}
       </p>
 
       <FirestoreStatus />

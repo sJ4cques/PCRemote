@@ -1,5 +1,13 @@
 export {};
 
+export interface SavedPair {
+  id: string;
+  name: string;
+  secret: string;
+  createdAt: number;
+  lastConnectedAt?: number;
+}
+
 declare global {
   interface Window {
     /** Args inyectados por el preload (automatización/pruebas). */
@@ -12,12 +20,20 @@ declare global {
       clipboardTest?: boolean;
       /** Si se lanza con --isis-autostop=<seg>, el cliente envía requestDisconnect a los N segundos. */
       autostop?: number;
+      /** Si se lanza con --isis-pair=<hostId>,<secret>, conecta directo a un host emparejado. */
+      pair?: { id: string; secret: string };
       /** Lee el texto del portapapeles del sistema. */
       readClipboard: () => Promise<string>;
       /** Escribe el texto en el portapapeles del sistema. */
       writeClipboard: (text: string) => Promise<void>;
       /** Alterna la pantalla completa de la ventana. */
       setFullscreen: (full: boolean) => void;
+      /** Devuelve la lista de equipos emparejados guardados. */
+      getPairs: () => Promise<SavedPair[]>;
+      /** Guarda/actualiza un equipo emparejado. Devuelve la lista. */
+      savePair: (rec: SavedPair) => Promise<SavedPair[]>;
+      /** Elimina un equipo emparejado. Devuelve la lista. */
+      removePair: (id: string) => Promise<SavedPair[]>;
     };
   }
 }

@@ -3,10 +3,12 @@ import {
   ClientPeer,
   FirestoreStatus,
   getFirebaseDb,
+  normalizeKey,
   type DataChannelMessage,
   type MouseAction,
   type PeerStatus,
 } from '@isisanubis/shared';
+import type { SavedPair } from './global';
 
 const STATUS_TOOLTIP: Record<PeerStatus, string> = {
   idle: 'En reposo',
@@ -28,6 +30,10 @@ const ERROR_DETAIL: Record<string, string> = {
   connection_failed: 'No se pudo establecer la conexión.',
   session_closed: 'La sesión fue cerrada por la máquina remota.',
   session_busy: 'La sesión ya está en uso por otro cliente (una sola sesión a la vez).',
+  pair_required: 'Este equipo exige emparejamiento. Guardalo desde "Añadir equipo".',
+  pair_token_invalid: 'El secreto de este equipo ya no es válido. Volvé a emparejar.',
+  pair_token_missing: 'El host no pudo validar tu emparejamiento.',
+  rejected: 'Conexión rechazada por la máquina remota.',
 };
 
 interface StreamStats {
@@ -37,6 +43,12 @@ interface StreamStats {
 }
 
 const App: React.FC = () => {
+  const [tab, setTab] = useState<'pairs' | 'manual'>('pairs');
+  const [pairs, setPairs] = useState<SavedPair[]>([]);
+  const [showAdd, setShowAdd] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [newId, setNewId] = useState('');
+  const [newSecret, setNewSecret] = useState('');
   const [code, setCode] = useState('');
   const [pin, setPin] = useState('');
   const [status, setStatus] = useState<PeerStatus>('idle');
@@ -44,13 +56,33 @@ const App: React.FC = () => {
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  const [hovering, setHovering] = useState(false);
+  const [remoteCursor, setRemoteCursor] = useState<{ x: number; y: number } | null>(null);
   const peerRef = useRef<ClientPeer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const cursorLogCountRef = useRef(0);
+  /** Throttle de moves: evita inundar el canal con decenas de puntos por segundo. */
+  const moveTimerRef = useRef<number | undefined>(undefined);
+  const pendingPointRef = useRef<{ x: number; y: number } | null>(null);
+  /** Resolución REAL del escritorio del host (donde se inyecta el mouse). La
+   *  captura puede llegar escalada (p. ej. 1920x1080 con pantalla 2560x1440),
+   *  así que el mapeo de coordenadas usa ESTE valor, no el del video. */
+  const hostDisplayRef = useRef<{ width: number; height: number } | null>(null);
   const lastMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const everConnectedRef = useRef(false);
+  const activePairIdRef = useRef<string | null>(null);
 
   /** Último valor del portapapeles local aplicado (evita ecos al sincronizar). */
   const lastClipboardRef = useRef<string | null>(null);
+
+  const refreshPairs = useCallback(() => {
+    void window.isis?.getPairs().then(setPairs);
+  }, []);
+
+  useEffect(() => {
+    refreshPairs();
+  }, [refreshPairs]);
 
   const toggleFullscreen = useCallback(() => {
     setFullscreen((prev) => {
@@ -72,25 +104,52 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [toggleFullscreen]);
 
-  /** Convierte un punto del elemento <video> (incluye letterboxing) a la posición
-   *  de pantalla del host según la resolución real del stream. */
+  /** Convierte un punto del elemento <video> (incluye letterboxing) a la
+   *  posición del escritorio del host según su resolución REAL. */
   const toHostPoint = useCallback((clientX: number, clientY: number) => {
     const video = videoRef.current;
-    if (!video || !video.videoWidth || !video.videoHeight) {
+    if (!video) {
+      return null;
+    }
+    const host = hostDisplayRef.current;
+    const hostW = host?.width ?? video.videoWidth;
+    const hostH = host?.height ?? video.videoHeight;
+    if (!hostW || !hostH) {
       return null;
     }
     const rect = video.getBoundingClientRect();
-    const scale = Math.min(rect.width / video.videoWidth, rect.height / video.videoHeight);
-    const drawW = video.videoWidth * scale;
-    const drawH = video.videoHeight * scale;
+    const scale = Math.min(rect.width / hostW, rect.height / hostH);
+    const drawW = hostW * scale;
+    const drawH = hostH * scale;
     const offsetX = (rect.width - drawW) / 2;
     const offsetY = (rect.height - drawH) / 2;
     const x = Math.round((clientX - rect.left - offsetX) / scale);
     const y = Math.round((clientY - rect.top - offsetY) / scale);
     return {
-      x: Math.min(Math.max(x, 0), video.videoWidth - 1),
-      y: Math.min(Math.max(y, 0), video.videoHeight - 1),
+      x: Math.min(Math.max(x, 0), hostW - 1),
+      y: Math.min(Math.max(y, 0), hostH - 1),
     };
+  }, []);
+
+  /** Mapea un punto del host al contenedor local (para el overlay del cursor). */
+  const toClientPoint = useCallback((hostX: number, hostY: number) => {
+    const container = containerRef.current;
+    if (!container) {
+      return null;
+    }
+    const host = hostDisplayRef.current;
+    const hostW = host?.width ?? videoRef.current?.videoWidth;
+    const hostH = host?.height ?? videoRef.current?.videoHeight;
+    if (!hostW || !hostH) {
+      return null;
+    }
+    const rect = container.getBoundingClientRect();
+    const scale = Math.min(rect.width / hostW, rect.height / hostH);
+    const drawW = hostW * scale;
+    const drawH = hostH * scale;
+    const left = (rect.width - drawW) / 2 + hostX * scale;
+    const top = (rect.height - drawH) / 2 + hostY * scale;
+    return { left, top };
   }, []);
 
   const send = useCallback((msg: DataChannelMessage): void => {
@@ -110,11 +169,19 @@ const App: React.FC = () => {
       if (!p) {
         return;
       }
-      if (p.x === lastMouseRef.current.x && p.y === lastMouseRef.current.y) {
-        return;
-      }
+      setRemoteCursor(p);
       lastMouseRef.current = p;
-      sendMouse({ type: 'move', x: p.x, y: p.y });
+      pendingPointRef.current = p;
+      if (moveTimerRef.current === undefined) {
+        moveTimerRef.current = window.setTimeout(() => {
+          moveTimerRef.current = undefined;
+          const target = pendingPointRef.current;
+          if (target) {
+            pendingPointRef.current = null;
+            sendMouse({ type: 'move', x: target.x, y: target.y });
+          }
+        }, 25);
+      }
     },
     [sendMouse, toHostPoint],
   );
@@ -127,6 +194,7 @@ const App: React.FC = () => {
         return;
       }
       lastMouseRef.current = p;
+      setRemoteCursor(p);
       const button = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
       sendMouse({ type: 'move', x: p.x, y: p.y });
       sendMouse({ type: 'down', button, x: p.x, y: p.y });
@@ -142,6 +210,7 @@ const App: React.FC = () => {
         return;
       }
       lastMouseRef.current = p;
+      setRemoteCursor(p);
       const button = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
       sendMouse({ type: 'move', x: p.x, y: p.y });
       sendMouse({ type: 'up', button, x: p.x, y: p.y });
@@ -157,12 +226,9 @@ const App: React.FC = () => {
     [sendMouse],
   );
 
-  const handleContextMenu = useCallback(
-    (e: React.MouseEvent<HTMLVideoElement>) => {
-      e.preventDefault();
-    },
-    [],
-  );
+  const handleContextMenu = useCallback((e: React.MouseEvent<HTMLVideoElement>) => {
+    e.preventDefault();
+  }, []);
 
   // --- Envío de teclado ------------------------------------------------
 
@@ -199,9 +265,6 @@ const App: React.FC = () => {
 
   // --- Portapapeles (sincronización bidireccional) ------------------------
 
-  /** Sincroniza el portapapeles del cliente → host mientras haya sesión.
-   *  Polling del portapapeles local cada 700 ms; si cambió, se propaga.
-   *  Al conectar se siembra el valor actual para no reenviar contenido previo. */
   useEffect(() => {
     if (status !== 'connected') {
       return;
@@ -354,8 +417,8 @@ const App: React.FC = () => {
   }, [remoteStream]);
 
   const connect = useCallback(
-    (codeArg?: string, pinArg?: string) => {
-      const c = (codeArg ?? code).trim().toLowerCase();
+    (codeArg?: string, pinArg?: string, secretArg?: string, pairName?: string) => {
+      const c = (secretArg ? normalizeKey(codeArg ?? '') : (codeArg ?? code).trim().toLowerCase()).trim();
       const p = pinArg ?? pin;
       if (!c) {
         return;
@@ -365,18 +428,28 @@ const App: React.FC = () => {
           await peerRef.current.stop();
           peerRef.current = null;
         }
+        activePairIdRef.current = secretArg ? c : null;
         setRemoteStream(null);
         const peer = new ClientPeer({
           db: getFirebaseDb(),
           code: c,
           deviceName: 'Client',
           pin: p || undefined,
+          secret: secretArg,
           onStatus: (s, d) => {
             console.log(`[client] status=${s}${d ? ` detail=${d}` : ''}`);
             setStatus(s);
             setDetail(d ? (ERROR_DETAIL[d] ?? d) : '');
             if (s === 'connected') {
-              console.log(`[client] CONNECTED code=${c}`);
+              console.log(`[client] CONNECTED code=${c}${pairName ? ` team=${pairName}` : ''}`);
+              if (activePairIdRef.current) {
+                void window.isis?.getPairs().then((list) => {
+                  const rec = list.find((x) => x.id === activePairIdRef.current);
+                  if (rec) {
+                    void window.isis?.savePair({ ...rec, lastConnectedAt: Date.now() });
+                  }
+                });
+              }
             }
           },
           onData: (msg) => {
@@ -387,6 +460,15 @@ const App: React.FC = () => {
               void window.isis?.writeClipboard(msg.payload.text);
               lastClipboardRef.current = msg.payload.text;
               console.log(`[client] clipboard_recv (remoto) len=${msg.payload.text.length}`);
+            } else if (msg.kind === 'display') {
+              hostDisplayRef.current = { width: msg.payload.width, height: msg.payload.height };
+              console.log(`[client] display_info ${msg.payload.width}x${msg.payload.height}`);
+            } else if (msg.kind === 'cursor') {
+              setRemoteCursor({ x: msg.payload.x, y: msg.payload.y });
+              cursorLogCountRef.current += 1;
+              if (cursorLogCountRef.current % 15 === 1) {
+                console.log(`[client] cursor_host ${msg.payload.x},${msg.payload.y}`);
+              }
             }
           },
           onChannelState: (open) => {
@@ -416,6 +498,7 @@ const App: React.FC = () => {
     void (async () => {
       await peerRef.current?.stop();
       peerRef.current = null;
+      activePairIdRef.current = null;
       setStatus('idle');
       setDetail('');
       setRemoteStream(null);
@@ -431,15 +514,22 @@ const App: React.FC = () => {
   const lostConnection =
     (status === 'ended' || status === 'error') && everConnectedRef.current;
 
+  const remoteActive = remoteStream && status === 'connected' && hovering;
+  const cursorBox = remoteActive && remoteCursor ? toClientPoint(remoteCursor.x, remoteCursor.y) : null;
+
   useEffect(() => {
     const args = window.isis;
-    if (args?.code) {
-      setCode(args.code);
-      if (args.pin) {
-        setPin(args.pin);
+    void (async () => {
+      if (args?.code) {
+        setCode(args.code);
+        if (args.pin) {
+          setPin(args.pin);
+        }
+        connect(args.code, args.pin);
+      } else if (args?.pair) {
+        connect(args.pair.id, '', args.pair.secret, args.pair.id);
       }
-      connect(args.code, args.pin);
-    }
+    })();
     return () => {
       void peerRef.current?.stop();
     };
@@ -448,12 +538,55 @@ const App: React.FC = () => {
 
   const busy = status === 'looking_up' || status === 'signaling' || status === 'connecting';
 
+  const handleConnectPair = useCallback(
+    (pair: SavedPair) => {
+      connect(pair.id, '', pair.secret, pair.name);
+    },
+    [connect],
+  );
+
+  const handleSavePair = useCallback(() => {
+    const id = normalizeKey(newId);
+    const secret = normalizeKey(newSecret);
+    const name = newName.trim() || id;
+    if (!id || !secret) {
+      setDetail('Completá ID del equipo y secreto.');
+      return;
+    }
+    void window.isis
+      ?.savePair({ id, secret, name, createdAt: Date.now() })
+      .then(setPairs)
+      .then(() => {
+        setShowAdd(false);
+        setNewName('');
+        setNewId('');
+        setNewSecret('');
+        setDetail(`Equipo "${name}" guardado`);
+        void window.isis?.getPairs().then(setPairs);
+      });
+  }, [newId, newSecret, newName]);
+
+  const handleRemovePair = useCallback(
+    (id: string) => {
+      void window.isis?.removePair(id).then(setPairs);
+    },
+    [],
+  );
+
   return (
     <div className="app">
       <h1>IsisAnubis Client</h1>
       <p className="muted">Equipo que controla (macOS).</p>
 
-      <div className="video-container">
+      <div
+        ref={containerRef}
+        className={`video-container ${remoteActive ? 'remote-active' : ''}`}
+        onMouseEnter={() => setHovering(true)}
+        onMouseLeave={() => {
+          setHovering(false);
+          setRemoteCursor(null);
+        }}
+      >
         {remoteStream ? (
           <video
             ref={videoRef}
@@ -482,6 +615,24 @@ const App: React.FC = () => {
           </div>
         )}
 
+        {cursorBox && (
+          <div
+            className="remote-cursor"
+            style={{ left: cursorBox.left, top: cursorBox.top }}
+            aria-hidden="true"
+          >
+            <svg viewBox="0 0 24 24" width="24" height="24">
+              <path
+                d="M3 1l7.5 18 3-7 7-3L3 1z"
+                fill="#fff"
+                stroke="#111"
+                strokeWidth="1.5"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </div>
+        )}
+
         {remoteStream && (
           <button
             type="button"
@@ -496,7 +647,20 @@ const App: React.FC = () => {
         {lostConnection && (
           <div className="lost-overlay">
             <p>Se perdió la conexión con la máquina remota.</p>
-            <button type="button" className="btn primary" onClick={() => connect()}>
+            <button
+              type="button"
+              className="btn primary"
+              onClick={() => {
+                const pair = activePairIdRef.current
+                  ? pairs.find((x) => x.id === activePairIdRef.current)
+                  : undefined;
+                if (pair) {
+                  handleConnectPair(pair);
+                } else {
+                  connect();
+                }
+              }}
+            >
               Reconectar
             </button>
           </div>
@@ -511,33 +675,137 @@ const App: React.FC = () => {
         )}
       </div>
 
-      <div className="form">
-        <label className="field">
-          <span>Código de la máquina</span>
-          <input
-            value={code}
-            onChange={(e) => setCode(e.target.value)}
-            placeholder="p. ej. abc234"
-            disabled={busy}
-            autoFocus
-          />
-        </label>
-        <label className="field">
-          <span>PIN (si la máquina lo exige)</span>
-          <input
-            type="password"
-            value={pin}
-            onChange={(e) => setPin(e.target.value)}
-            placeholder="Opcional"
-            disabled={busy}
-          />
-        </label>
-        <div className="actions">
-          {status === 'connected' ? (
-            <button type="button" className="btn danger" onClick={disconnect}>
-              Desconectar
+      <div className="mode-tabs">
+        <button
+          type="button"
+          className={`mode-tab ${tab === 'pairs' ? 'active' : ''}`}
+          onClick={() => setTab('pairs')}
+        >
+          Mis equipos
+        </button>
+        <button
+          type="button"
+          className={`mode-tab ${tab === 'manual' ? 'active' : ''}`}
+          onClick={() => setTab('manual')}
+        >
+          Código
+        </button>
+        {status === 'connected' && (
+          <button type="button" className="btn danger small-inline" onClick={disconnect}>
+            Desconectar
+          </button>
+        )}
+      </div>
+
+      {tab === 'pairs' && (
+        <div className="pairs-view">
+          {pairs.length === 0 && !showAdd && (
+            <p className="muted">
+              Todavía no tenés equipos emparejados. Agregá uno con el ID y secreto que muestra el host
+              en su panel "Emparejado".
+            </p>
+          )}
+
+          {pairs.map((pair) => (
+            <div className="pair-card" key={pair.id}>
+              <div className="pair-card-info">
+                <span className="pair-card-name">{pair.name}</span>
+                <span className="pair-card-id">{pair.id}</span>
+              </div>
+              {status === 'connected' && activePairIdRef.current === pair.id ? (
+                <button type="button" className="btn danger" onClick={disconnect}>
+                  Desconectar
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => handleConnectPair(pair)}
+                  disabled={busy}
+                >
+                  Conectar
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => handleRemovePair(pair.id)}
+                title="Quitar equipo"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+
+          {showAdd && (
+            <div className="form">
+              <label className="field">
+                <span>Nombre del equipo</span>
+                <input
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  placeholder="p. ej. PC de escritorio"
+                />
+              </label>
+              <label className="field">
+                <span>ID del equipo (del panel del host)</span>
+                <input
+                  value={newId}
+                  onChange={(e) => setNewId(e.target.value)}
+                  placeholder="8 caracteres"
+                />
+              </label>
+              <label className="field">
+                <span>Secreto (del panel del host)</span>
+                <input
+                  type="password"
+                  value={newSecret}
+                  onChange={(e) => setNewSecret(e.target.value)}
+                  placeholder="8 caracteres"
+                />
+              </label>
+              <div className="actions">
+                <button type="button" className="btn primary" onClick={handleSavePair}>
+                  Guardar equipo
+                </button>
+                <button type="button" className="btn" onClick={() => setShowAdd(false)}>
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          )}
+
+          {!showAdd && (
+            <button type="button" className="btn" onClick={() => setShowAdd(true)}>
+              + Añadir equipo
             </button>
-          ) : (
+          )}
+        </div>
+      )}
+
+      {tab === 'manual' && (
+        <div className="form">
+          <label className="field">
+            <span>Código de la máquina</span>
+            <input
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="p. ej. abc234"
+              disabled={busy}
+              autoFocus
+            />
+          </label>
+          <label className="field">
+            <span>PIN (si la máquina lo exige)</span>
+            <input
+              type="password"
+              value={pin}
+              onChange={(e) => setPin(e.target.value)}
+              placeholder="Opcional"
+              disabled={busy}
+            />
+          </label>
+          <div className="actions">
             <button
               type="button"
               className="btn primary"
@@ -546,9 +814,9 @@ const App: React.FC = () => {
             >
               Conectar
             </button>
-          )}
+          </div>
         </div>
-      </div>
+      )}
 
       <p className={`pill ${status}`}>
         {STATUS_TOOLTIP[status]}

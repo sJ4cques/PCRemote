@@ -1,8 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 // Args opcionales inyectados desde el proceso main (probar/automatizar la app):
-//   --isis-code=<codigo>  --isis-pin=<pin>  --isis-simulate-video
-//   --isis-simulate-audio  --isis-fake-input
+//   --isis-code=<codigo>  --isis-pin=<pin>  --isis-session-ttl=<seg>
+//   --isis-simulate-video  --isis-simulate-audio  --isis-fake-input
+//   --isis-host-id=<id>  --isis-pair-secret=<secret>  --isis-service
 const isisArgs: {
   code?: string;
   pin?: string;
@@ -10,7 +11,16 @@ const isisArgs: {
   simulateVideo?: boolean;
   simulateAudio?: boolean;
   fakeInput?: boolean;
-} = {};
+  hostId?: string;
+  pairSecret?: string;
+  service?: boolean;
+  manual?: boolean;
+  captureTest?: boolean;
+  forceGetDisplayMedia?: boolean;
+  platform: string;
+} = {
+  platform: process.platform,
+};
 
 for (const arg of process.argv) {
   if (arg.startsWith('--isis-code=')) {
@@ -22,12 +32,24 @@ for (const arg of process.argv) {
     if (Number.isFinite(value) && value > 0) {
       isisArgs.sessionTtl = value;
     }
+  } else if (arg.startsWith('--isis-host-id=')) {
+    isisArgs.hostId = arg.slice('--isis-host-id='.length);
+  } else if (arg.startsWith('--isis-pair-secret=')) {
+    isisArgs.pairSecret = arg.slice('--isis-pair-secret='.length);
   } else if (arg === '--isis-simulate-video') {
     isisArgs.simulateVideo = true;
   } else if (arg === '--isis-simulate-audio') {
     isisArgs.simulateAudio = true;
   } else if (arg === '--isis-fake-input') {
     isisArgs.fakeInput = true;
+  } else if (arg === '--isis-service') {
+    isisArgs.service = true;
+  } else if (arg === '--isis-manual') {
+    isisArgs.manual = true;
+  } else if (arg === '--isis-capture-test') {
+    isisArgs.captureTest = true;
+  } else if (arg === '--isis-force-getdisplaymedia') {
+    isisArgs.forceGetDisplayMedia = true;
   }
 }
 
@@ -46,6 +68,55 @@ contextBridge.exposeInMainWorld('isis', {
   /** Escribe el texto en el portapapeles del sistema. */
   writeClipboard: (text: string): Promise<void> =>
     ipcRenderer.invoke('isis:clipboard-write', text) as Promise<void>,
+  /** Configuración del host (hostId, secret, autostart, service, sim flags). */
+  getConfig: (): Promise<HostConfigView> => ipcRenderer.invoke('isis:config-get') as Promise<HostConfigView>,
+  /** Actualiza campos de config (deviceName, service). */
+  setConfig: (patch: Partial<Pick<HostConfigView, 'deviceName' | 'service'>>): Promise<unknown> =>
+    ipcRenderer.invoke('isis:config-set', patch),
+  /** Devuelve si el host inicia con Windows. */
+  getAutostart: (): Promise<boolean> => ipcRenderer.invoke('isis:autostart-get') as Promise<boolean>,
+  /** Activa/desactiva el inicio con Windows. */
+  setAutostart: (on: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('isis:autostart-set', on) as Promise<boolean>,
+  /** Regenera hostId + secreto. Devuelve el par nuevo. */
+  regeneratePairing: (): Promise<{ hostId: string; secret: string }> =>
+    ipcRenderer.invoke('isis:regenerate-pairing') as Promise<{ hostId: string; secret: string }>,
+  /** Oculta la ventana (modo servicio). */
+  hideWindow: (): void => {
+    ipcRenderer.send('isis:hide-window');
+  },
+  /** Actualiza el tooltip del tray. */
+  setTrayStatus: (text: string): void => {
+    ipcRenderer.send('isis:tray-status', text);
+  },
+  /** Suscriptor de acciones de la bandeja (p. ej. "Desconectar sesión"). */
+  onControl: (cb: (cmd: string) => void): (() => void) => {
+    const listener = (_e: unknown, cmd: string): void => cb(cmd);
+    ipcRenderer.on('isis:ctrl-disconnect', listener);
+    return () => ipcRenderer.removeListener('isis:ctrl-disconnect', listener);
+  },
+  /** Activa/desactiva el streaming de la posición del cursor + resolución del host. */
+  watchCursor: (on: boolean): void => {
+    ipcRenderer.send(on ? 'isis:cursor-watch' : 'isis:cursor-unwatch');
+  },
+  /** Recibe la posición del cursor del host (y la resolución del escritorio). */
+  onCursorEvent: (cb: (e: { x: number; y: number; width: number; height: number }) => void): (() => void) => {
+    const listener = (_e: unknown, data: { x: number; y: number; width: number; height: number }): void =>
+      cb(data);
+    ipcRenderer.on('isis:cursor-event', listener);
+    return () => ipcRenderer.removeListener('isis:cursor-event', listener);
+  },
 });
 
 export {};
+
+interface HostConfigView {
+  hostId: string;
+  secret: string;
+  deviceName: string;
+  service: boolean;
+  autostart: boolean;
+  simulateVideo: boolean;
+  simulateAudio: boolean;
+  fakeInput: boolean;
+}

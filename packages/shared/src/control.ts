@@ -21,6 +21,18 @@ export interface ClipboardEventData {
   text: string;
 }
 
+/** Resolución REAL del escritorio del host (espacio donde se inyecta el mouse). */
+export interface DisplayInfo {
+  width: number;
+  height: number;
+}
+
+/** Posición actual del cursor del HOST (el overlay del cliente lo dibuja). */
+export interface CursorInfo {
+  x: number;
+  y: number;
+}
+
 export type ControlCommand =
   | { kind: "requestDisconnect" }
   | { kind: "healthcheck" };
@@ -36,7 +48,9 @@ export type DataChannelMessage =
   | { kind: "mouse"; payload: MouseAction }
   | { kind: "key"; payload: KeyEvent }
   | { kind: "clipboard"; payload: ClipboardEventData }
-  | { kind: "control"; payload: ControlCommand };
+  | { kind: "control"; payload: ControlCommand }
+  | { kind: "display"; payload: DisplayInfo }
+  | { kind: "cursor"; payload: CursorInfo };
 
 /** Codifica una mensaje para enviarlo por el DataChannel (JSON). */
 export function encodeDataChannelMessage(msg: DataChannelMessage): string {

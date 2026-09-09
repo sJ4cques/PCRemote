@@ -153,3 +153,92 @@ body {
 .code-block .muted {
   font-size: 0.8rem;
 }
+
+.mode-tabs {
+  display: flex;
+  gap: 0.5rem;
+  background: #1a1d23;
+  padding: 0.25rem;
+  border-radius: 10px;
+}
+
+.mode-tab {
+  border: none;
+  background: transparent;
+  color: #8a8f98;
+  padding: 0.4rem 1rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mode-tab.active {
+  background: #3a7dff;
+  color: #fff;
+}
+
+.pairing-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  max-width: 340px;
+  padding: 1rem;
+  border: 1px dashed #3a7dff;
+  border-radius: 12px;
+  background: #0e1420;
+}
+
+.pairing-block .muted {
+  font-size: 0.8rem;
+}
+
+.pairing-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: #8a8f98;
+  width: 100%;
+  justify-content: center;
+}
+
+.pairing-key {
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  padding: 0.35rem 0.8rem;
+  background: #11161f;
+  color: #e8e8ea;
+  border: 1px solid #2b2f36;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.btn.small {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.75rem;
+}
+
+.actions.column {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.row-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.88rem;
+  color: #8a8f98;
+  cursor: pointer;
+}
+
+.row-toggle input {
+  accent-color: #3a7dff;
+}
