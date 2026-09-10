@@ -35,7 +35,15 @@ export interface CursorInfo {
 
 export type ControlCommand =
   | { kind: "requestDisconnect" }
-  | { kind: "healthcheck" };
+  | { kind: "healthcheck" }
+  | { kind: "pong" }
+  | { kind: "bye" }
+  /**
+   * El cliente detectó que el host no responde (cursor congelado mientras el
+   * usuario mueve el mouse): pide al host liberar botones y reiniciar la cola
+   * de input para recuperar el control.
+   */
+  | { kind: "inputReset" };
 
 /** Saludo inicial al abrir el canal de datos (Fase 1: verificar conectividad). */
 export interface HelloPayload {

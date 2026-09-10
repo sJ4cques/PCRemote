@@ -17,6 +17,7 @@ const isisArgs: {
   manual?: boolean;
   captureTest?: boolean;
   forceGetDisplayMedia?: boolean;
+  desktopAudio?: boolean;
   platform: string;
 } = {
   platform: process.platform,
@@ -50,6 +51,8 @@ for (const arg of process.argv) {
     isisArgs.captureTest = true;
   } else if (arg === '--isis-force-getdisplaymedia') {
     isisArgs.forceGetDisplayMedia = true;
+  } else if (arg === '--isis-desktop-audio') {
+    isisArgs.desktopAudio = true;
   }
 }
 
@@ -62,6 +65,15 @@ contextBridge.exposeInMainWorld('isis', {
   sendInput: (msg: unknown): void => {
     ipcRenderer.send('isis:input', msg);
   },
+  /** Libera todos los botones del mouse (al cerrar/cambiar de sesión). */
+  releaseInputButtons: (): void => {
+    ipcRenderer.send('isis:input-release');
+  },
+  /** Pánico: libera botones, despeja la cola y cierra un menú/flyout del sistema
+   *  que haya quedado abierto bloqueando el input (menús elevados de bandeja/taskbar). */
+  inputPanic: (): void => {
+    ipcRenderer.send('isis:input-panic');
+  },
   /** Lee el texto del portapapeles del sistema. */
   readClipboard: (): Promise<string> =>
     ipcRenderer.invoke('isis:clipboard-read') as Promise<string>,
@@ -73,11 +85,11 @@ contextBridge.exposeInMainWorld('isis', {
   /** Actualiza campos de config (deviceName, service). */
   setConfig: (patch: Partial<Pick<HostConfigView, 'deviceName' | 'service'>>): Promise<unknown> =>
     ipcRenderer.invoke('isis:config-set', patch),
-  /** Devuelve si el host inicia con Windows. */
+  /** Devuelve si el inicio con Windows está activo (existe la tarea programada). */
   getAutostart: (): Promise<boolean> => ipcRenderer.invoke('isis:autostart-get') as Promise<boolean>,
-  /** Activa/desactiva el inicio con Windows. */
-  setAutostart: (on: boolean): Promise<boolean> =>
-    ipcRenderer.invoke('isis:autostart-set', on) as Promise<boolean>,
+  /** Activa/desactiva el inicio elevado con Windows (tarea programada /RL HIGHEST). */
+  setAutostart: (on: boolean): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('isis:autostart-set', on) as Promise<{ ok: boolean; error?: string }>,
   /** Regenera hostId + secreto. Devuelve el par nuevo. */
   regeneratePairing: (): Promise<{ hostId: string; secret: string }> =>
     ipcRenderer.invoke('isis:regenerate-pairing') as Promise<{ hostId: string; secret: string }>,

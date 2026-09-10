@@ -6,6 +6,7 @@ export interface HostConfigView {
   deviceName: string;
   service: boolean;
   autostart: boolean;
+  desktopAudio: boolean;
   simulateVideo: boolean;
   simulateAudio: boolean;
   fakeInput: boolean;
@@ -37,6 +38,8 @@ declare global {
       captureTest?: boolean;
       /** Salta getUserMedia y usa getDisplayMedia para capturar (--isis-force-getdisplaymedia). */
       forceGetDisplayMedia?: boolean;
+      /** Captura el audio de escritorio (loopback) en Windows (--isis-desktop-audio / config). */
+      desktopAudio?: boolean;
       /** Plataforma del host ('darwin' | 'win32' | 'linux'). */
       platform: string;
       /** Id de la pantalla a capturar con getUserMedia (desktopCapturer). */
@@ -49,12 +52,14 @@ declare global {
       writeClipboard: (text: string) => Promise<void>;
       /** Configuración del host (hostId, secret, autostart, service, sim flags). */
       getConfig: () => Promise<HostConfigView>;
-      /** Actualiza campos de config (deviceName, service). */
-      setConfig: (patch: Partial<Pick<HostConfigView, 'deviceName' | 'service'>>) => Promise<unknown>;
-      /** Devuelve si el host inicia con Windows. */
+      /** Actualiza campos de config (deviceName, service, desktopAudio). */
+      setConfig: (
+        patch: Partial<Pick<HostConfigView, 'deviceName' | 'service' | 'desktopAudio'>>,
+      ) => Promise<unknown>;
+      /** Devuelve si el inicio con Windows está activo (existe la tarea programada). */
       getAutostart: () => Promise<boolean>;
-      /** Activa/desactiva el inicio con Windows. */
-      setAutostart: (on: boolean) => Promise<boolean>;
+      /** Activa/desactiva el inicio elevado con Windows (tarea programada /RL HIGHEST). */
+      setAutostart: (on: boolean) => Promise<{ ok: boolean; error?: string }>;
       /** Regenera hostId + secreto. Devuelve el par nuevo. */
       regeneratePairing: () => Promise<{ hostId: string; secret: string }>;
       /** Oculta la ventana (modo servicio). */
@@ -65,6 +70,11 @@ declare global {
       onControl: (cb: (cmd: string) => void) => () => void;
       /** Activa/desactiva el streaming de la posición del cursor + resolución del host. */
       watchCursor: (on: boolean) => void;
+      /** Libera todos los botones del mouse (al cerrar/cambiar de sesión). */
+      releaseInputButtons: () => void;
+      /** Pánico: libera botones, despeja la cola y cierra un menú/flyout del
+       *  sistema abierto que bloquea el input (menús elevados de bandeja/taskbar). */
+      inputPanic: () => void;
       /** Recibe la posición del cursor del host (y la resolución del escritorio). */
       onCursorEvent: (cb: (e: { x: number; y: number; width: number; height: number }) => void) => () => void;
     };

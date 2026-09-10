@@ -99,6 +99,7 @@ const App: React.FC = () => {
   const [status, setStatus] = useState<PeerStatus>('idle');
   const [detail, setDetail] = useState('');
   const [screenMode, setScreenMode] = useState<ScreenMode>('off');
+  const [audioMode, setAudioMode] = useState<'off' | 'simulated' | 'loopback'>('off');
   const [captureMode, setCaptureMode] = useState<'legacy' | 'getDisplayMedia' | null>(null);
   const [captureError, setCaptureError] = useState('');
   const [restartKey, setRestartKey] = useState(0);
@@ -119,6 +120,50 @@ const App: React.FC = () => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     setScreenMode('off');
+    setAudioMode('off');
+  }, []);
+
+  /**
+   * Agrega el audio de escritorio (loopback) del host al stream, SOLO Windows.
+   * Se pide en una llamada getDisplayMedia separada (audio únicamente) para no
+   * reintroducir la fragilidad del video: pedir video+audio del escritorio en
+   * una misma getUserMedia rompe la captura de video en Windows.
+   *
+   * Está gateado por --isis-desktop-audio / config desktopAudio (OFF por default):
+   * en algunos Windows abrir esta segunda captura degrada el renderer y rompe
+   * el input (mouse/clics). La captura de pantalla verifica entonces que el flag
+   * haya llegado al renderer.
+   */
+  const addDesktopAudio = useCallback(async (stream: MediaStream): Promise<void> => {
+    const platform = window.isis?.platform ?? 'darwin';
+    if (
+      platform !== 'win32' ||
+      window.isis?.simulateVideo ||
+      window.isis?.desktopAudio !== true
+    ) {
+      if (platform === 'win32' && !window.isis?.simulateVideo) {
+        console.log('[host] stream_audio=off (loopback desactivado; actívalo en el panel)');
+      }
+      return;
+    }
+    try {
+      const audioStream = (await navigator.mediaDevices.getDisplayMedia({
+        audio: true,
+        video: false,
+      } as MediaStreamConstraints)) as MediaStream;
+      const audioTracks = audioStream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        audioStream.getTracks().forEach((t) => t.stop());
+        setAudioMode('off');
+        return;
+      }
+      audioTracks.forEach((t) => stream.addTrack(t));
+      setAudioMode('loopback');
+      console.log(`[host] stream_audio=loopback tracks=${audioTracks.length}`);
+    } catch (err) {
+      console.warn('[host] audio loopback fallida; sin audio:', err);
+      setAudioMode('off');
+    }
   }, []);
 
   const getScreenStream = useCallback(async (): Promise<MediaStream | null> => {
@@ -162,10 +207,14 @@ const App: React.FC = () => {
       if (window.isis?.simulateAudio) {
         const audioTrack = await createSyntheticAudioTrack();
         stream.addTrack(audioTrack);
+        setAudioMode('simulated');
         console.log('[host] stream_audio=simulated');
+      } else if (window.isis?.simulateVideo) {
+        console.log('[host] stream_audio=off');
       } else {
+        await addDesktopAudio(stream);
         console.log(
-          `[host] stream_audio=${stream.getAudioTracks().length > 0 ? 'real' : 'off'}`,
+          `[host] stream_audio_final=${stream.getAudioTracks().length > 0 ? 'yes' : 'off'}`,
         );
       }
 
@@ -260,6 +309,12 @@ const App: React.FC = () => {
       console.log(`[host] control ${msg.payload.kind}`);
       if (msg.payload.kind === 'requestDisconnect') {
         void (peer ?? peerRef.current)?.stop();
+      } else if (msg.payload.kind === 'inputReset') {
+        // El cliente detectó el host congelado (cursor sin respuesta): liberar
+        // botones pegados, despejar la cola y, si hay un menú/flyout del sistema
+        // abierto tragándose el input (menús elevados de bandeja/taskbar), cerrarlo.
+        console.log('[host] input_reset solicitado por el cliente');
+        window.isis?.inputPanic();
       }
     }
   }, []);
@@ -267,6 +322,10 @@ const App: React.FC = () => {
   const onChannelState = useCallback((open: boolean) => {
     console.log(`[host] channel_state=${open ? 'open' : 'closed'}`);
     channelOpenRef.current = open;
+    // Al cerrar (o al volver a abrir, p. ej. cliente nuevo) no dejamos botones
+    // presionados de la sesión anterior: si se perdió el `up` en el corte, el
+    // SO quedaría con el botón físico pulsado (mause trabado).
+    window.isis?.releaseInputButtons();
     if (open && displayInfoRef.current) {
       const { width, height } = displayInfoRef.current;
       peerRef.current?.send({ kind: 'display', payload: { width, height } });
@@ -300,7 +359,17 @@ const App: React.FC = () => {
         peerRef.current?.send({ kind: 'cursor', payload: { x, y } });
       }
     });
+    // Heartbeat del cursor: reenvía la última posición aunque NO cambie, para que
+    // el cliente distinga "cursor quieto pero canal vivo" de "canal muerto". Sin
+    // esto, cuando el menú de la bandeja se traga el input y el cursor no se
+    // mueve, el cliente no ve NINGÚN mensaje de cursor y dispara inputReset.
+    const heartbeat = window.setInterval(() => {
+      if (channelOpenRef.current && lastSentCursorRef.current) {
+        peerRef.current?.send({ kind: 'cursor', payload: lastSentCursorRef.current });
+      }
+    }, 400);
     return () => {
+      window.clearInterval(heartbeat);
       unsub?.();
       window.isis?.watchCursor(false);
     };
@@ -528,8 +597,18 @@ const App: React.FC = () => {
       const next = !autostart;
       setAutostart(next);
       const applied = await window.isis?.setAutostart(next);
-      setAutostart(Boolean(applied));
-      setDetail(next ? 'Inicio con Windows activado' : 'Inicio con Windows desactivado');
+      if (!applied) {
+        setAutostart(!next);
+        return;
+      }
+      if (applied.ok) {
+        setDetail(next ? 'Inicio elevado con Windows activado' : 'Inicio elevado con Windows desactivado');
+      } else {
+        setAutostart(!next);
+        setDetail(
+          `No se pudo ${next ? 'activar' : 'desactivar'} el inicio con Windows: ejecuta el host como administrador y vuelve a intentarlo (${applied.error ?? 'error'})`,
+        );
+      }
     })();
   }, [autostart]);
 
@@ -728,8 +807,28 @@ const App: React.FC = () => {
       </p>
 
       <p className="muted">
-        Audio: {window.isis?.simulateAudio ? 'tono sintético (prueba)' : 'no transmitido'}
+        Audio:{' '}
+        {audioMode === 'simulated'
+          ? 'tono sintético (prueba)'
+          : audioMode === 'loopback'
+            ? 'escritorio (loopback)'
+            : 'no transmitido'}
       </p>
+
+      {window.isis?.platform === 'win32' && !window.isis?.simulateVideo && (
+        <label className="field checkbox">
+          <span>Audio de escritorio (loopback)</span>
+          <input
+            type="checkbox"
+            checked={config?.desktopAudio ?? false}
+            onChange={(e) => {
+              window.isis
+                ?.setConfig({ desktopAudio: e.target.checked })
+                .then(() => window.isis?.getConfig().then(setConfig));
+            }}
+          />
+        </label>
+      )}
 
       <FirestoreStatus />
     </div>

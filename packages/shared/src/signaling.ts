@@ -164,7 +164,11 @@ export class HostPeer {
   private lastOffer?: string;
   private stopped = false;
   private seenCandidates = new Set<string>();
+  /** Candidatos remotos que llegaron antes del remote description (trickle). */
+  private pendingCandidates: IceCandidateDoc[] = [];
   private waitTimer: ReturnType<typeof setTimeout> | null = null;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private lastClientActivityAt = 0;
 
   constructor(options: HostPeerOptions) {
     this.db = options.db;
@@ -260,6 +264,10 @@ export class HostPeer {
       clearTimeout(this.waitTimer);
       this.waitTimer = null;
     }
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
     this.unsubDoc?.();
     this.unsubCandidates?.();
     this.unsubDoc = null;
@@ -277,6 +285,17 @@ export class HostPeer {
       });
     } catch {
       // La sesión ya no existe; no pasa nada.
+    }
+
+    try {
+      // Si el canal sigue abierto, avisamos al cliente que nos vamos para que
+      // corte de inmediato (y recicle) en vez de quedarse en "connected".
+      if (this.dc?.readyState === "open") {
+        this.dc.send(JSON.stringify({ kind: "control", payload: { kind: "bye" } }));
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+    } catch {
+      // El canal ya está muerto; solo cerramos.
     }
 
     try {
@@ -311,17 +330,51 @@ export class HostPeer {
     this.dc = dc;
     dc.onopen = () => {
       this.onChannelState?.(true);
+      this.lastClientActivityAt = Date.now();
       this.send({ kind: "hello", payload: { sessionId: this.code, deviceName: this.deviceName } });
+      this.startHostKeepalive();
     };
     dc.onclose = () => {
       this.onChannelState?.(false);
     };
     dc.onmessage = (ev) => {
+      this.lastClientActivityAt = Date.now();
       const msg = decodeDataChannelMessage(ev.data);
-      if (msg) {
-        this.onData?.(msg);
+      if (!msg) {
+        return;
       }
+      // El host responde a los healthcheck del cliente (keepalive) sin
+      // reenviarlos a la UI.
+      if (msg.kind === "control" && msg.payload.kind === "healthcheck") {
+        this.send({ kind: "control", payload: { kind: "pong" } });
+        return;
+      }
+      // El cliente avisó que se va: liberamos la sesión ya, sin esperar al
+      // keepalive (evita 20s de "sesión fantasma" en el host).
+      if (msg.kind === "control" && msg.payload.kind === "bye") {
+        void this.stop("client_closed").catch(() => undefined);
+        return;
+      }
+      this.onData?.(msg);
     };
+  }
+
+  /** Si el cliente no dice nada en 20 s, el canal está muerto o el cliente se
+   *  fue sin avisar: liberamos la sesión (estado fantasma) para que el próximo
+   *  cliente pueda entrar y el cliente actual muestre "se perdió la conexión". */
+  private startHostKeepalive(): void {
+    if (this.keepaliveTimer) {
+      return;
+    }
+    this.keepaliveTimer = setInterval(() => {
+      if (this.stopped) {
+        return;
+      }
+      if (this.dc?.readyState === "open" && Date.now() - this.lastClientActivityAt > 20_000) {
+        console.warn(`[HostPeer/${this.code}] cliente sin actividad 20s; cerrando sesión fantasma`);
+        void this.stop("client_offline").catch(() => undefined);
+      }
+    }, 5000);
   }
 
   private async pushCandidate(candidate: RTCIceCandidate): Promise<void> {
@@ -391,6 +444,8 @@ export class HostPeer {
       await this.pc.setRemoteDescription(
         new RTCSessionDescription(JSON.parse(offerJson) as RTCSessionDescriptionInit),
       );
+      // Candidatos que llegaron antes del offer: aplicarlos ya.
+      this.flushPendingCandidates();
 
       if (!this.screenStream && this.getScreenStream) {
         try {
@@ -431,8 +486,26 @@ export class HostPeer {
       if (!data.candidate || this.seenCandidates.has(data.candidate)) {
         continue;
       }
+      // Los candidatos pueden llegar ANTES de que haya remoteDescription
+      // (trickle + doc) y addIceCandidate los rechaza. Si los marcamos como
+      // vistos y no los reaplicamos, la conexión queda coja (sin candidatos
+      // del remoto) y se cae con connection_failed. Por eso se encolan y se
+      // aplican al procesar la descripción remota (flushPendingCandidates).
       this.seenCandidates.add(data.candidate);
-      void this.addRemoteCandidate(data);
+      if (this.pc?.remoteDescription) {
+        void this.addRemoteCandidate(data);
+      } else {
+        this.pendingCandidates.push(data);
+      }
+    }
+  }
+
+  /** Aplica los candidatos encolados antes de tener la descripción remota. */
+  private flushPendingCandidates(): void {
+    const pending = this.pendingCandidates;
+    this.pendingCandidates = [];
+    for (const candidate of pending) {
+      void this.addRemoteCandidate(candidate);
     }
   }
 
@@ -470,10 +543,14 @@ export class HostPeer {
       case "failed":
         this.onStatus("error", "connection_failed");
         break;
-      case "disconnected":
       case "closed":
+        // Cierre real (stop() de cualquiera de los dos, o remoto). La sesión
+        // queda en "espera" para el próximo cliente (modo emparejado).
         this.onStatus("ended");
         break;
+      // "disconnected" es TRANSITORIO en WebRTC (un parpadeo de red puede
+      // volver a "connected"). NO cerramos por eso: el keepalive del canal
+      // detecta una caída real en silencio.
       default:
         break;
     }
@@ -530,7 +607,12 @@ export class ClientPeer {
   private answerReceived = false;
   private stopped = false;
   private seenCandidates = new Set<string>();
+  /** Candidatos remotos que llegaron antes del remote description (trickle). */
+  private pendingCandidates: IceCandidateDoc[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private lastPongAt = 0;
+  private keepaliveLogged = false;
 
   constructor(options: ClientPeerOptions) {
     this.db = options.db;
@@ -654,15 +736,30 @@ export class ClientPeer {
       return;
     }
     this.stopped = true;
+    this.keepaliveLogged = false;
 
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
     this.unsubDoc?.();
     this.unsubCandidates?.();
     this.unsubDoc = null;
     this.unsubCandidates = null;
+
+    try {
+      // Avisamos al host para que libere la sesión ya (sin esperar client_offline).
+      if (this.dc?.readyState === "open") {
+        this.dc.send(JSON.stringify({ kind: "control", payload: { kind: "bye" } }));
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+    } catch {
+      // El canal ya está muerto; solo cerramos.
+    }
 
     try {
       this.dc?.close();
@@ -708,17 +805,56 @@ export class ClientPeer {
     this.dc = dc;
     dc.onopen = () => {
       this.onChannelState?.(true);
+      this.lastPongAt = Date.now();
       this.send({ kind: "hello", payload: { sessionId: this.code, deviceName: this.deviceName } });
+      this.startClientKeepalive();
     };
     dc.onclose = () => {
       this.onChannelState?.(false);
     };
     dc.onmessage = (ev) => {
       const msg = decodeDataChannelMessage(ev.data);
-      if (msg) {
-        this.onData?.(msg);
+      if (!msg) {
+        return;
       }
+      if (msg.kind === "control" && msg.payload.kind === "pong") {
+        this.lastPongAt = Date.now();
+        return;
+      }
+      // El host cortó (p. ej. requestDisconnect del propio cliente o cierre del
+      // tray). Cerramos de inmediato para no quedarnos en "connected" con un
+      // canal muerto (que además disparaba retries del keepalive).
+      if (msg.kind === "control" && msg.payload.kind === "bye") {
+        void this.stop("bye").catch(() => undefined);
+        return;
+      }
+      this.onData?.(msg);
     };
+  }
+
+  /** Ping cada 5 s. Si el canal muere en silencio (sin que cambie el estado ICE),
+   *  el host deja de contestar y a los 15 s declaramos la caída: sin esto los
+   *  inputs se enviarían a un canal muerto, "congelando" el control. */
+  private startClientKeepalive(): void {
+    if (this.keepaliveTimer) {
+      return;
+    }
+    this.keepaliveTimer = setInterval(() => {
+      if (this.stopped) {
+        return;
+      }
+      if (this.dc?.readyState !== "open") {
+        return;
+      }
+      this.send({ kind: "control", payload: { kind: "healthcheck" } });
+      if (Date.now() - this.lastPongAt > 15_000) {
+        if (!this.keepaliveLogged) {
+          this.keepaliveLogged = true;
+          console.warn(`[ClientPeer/${this.code}] canal sin pong 15s; cerrando`);
+        }
+        void this.stop("keepalive_timeout").catch(() => undefined);
+      }
+    }, 5000);
   }
 
   private async pushCandidate(candidate: RTCIceCandidate): Promise<void> {
@@ -768,6 +904,8 @@ export class ClientPeer {
       await this.pc.setRemoteDescription(
         new RTCSessionDescription(JSON.parse(answerJson) as RTCSessionDescriptionInit),
       );
+      // Candidatos que llegaron antes del answer: aplicarlos ya.
+      this.flushPendingCandidates();
     } catch (err) {
       console.error(`[ClientPeer/${this.code}] setRemoteDescription error:`, err);
       this.onStatus("error", "answer_invalid");
@@ -780,8 +918,25 @@ export class ClientPeer {
       if (!data.candidate || this.seenCandidates.has(data.candidate)) {
         continue;
       }
+      // Los candidatos pueden llegar ANTES de que haya remoteDescription
+      // (trickle + doc) y addIceCandidate los rechaza. Si los marcamos como
+      // vistos y no los reaplicamos, la conexión queda coja y se cae con
+      // connection_failed. Se encolan y se aplican al procesar el answer.
       this.seenCandidates.add(data.candidate);
-      void this.addRemoteCandidate(data);
+      if (this.pc?.remoteDescription) {
+        void this.addRemoteCandidate(data);
+      } else {
+        this.pendingCandidates.push(data);
+      }
+    }
+  }
+
+  /** Aplica los candidatos encolados antes de tener el remote description. */
+  private flushPendingCandidates(): void {
+    const pending = this.pendingCandidates;
+    this.pendingCandidates = [];
+    for (const candidate of pending) {
+      void this.addRemoteCandidate(candidate);
     }
   }
 
@@ -815,10 +970,10 @@ export class ClientPeer {
       case "failed":
         this.onStatus("error", "connection_failed");
         break;
-      case "disconnected":
       case "closed":
         this.onStatus("ended");
         break;
+      // "disconnected" es transitorio; el keepalive decide si hubo caída real.
       default:
         break;
     }

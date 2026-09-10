@@ -6,6 +6,7 @@ import {
   normalizeKey,
   type DataChannelMessage,
   type MouseAction,
+  type MouseButton,
   type PeerStatus,
 } from '@isisanubis/shared';
 import type { SavedPair } from './global';
@@ -43,7 +44,8 @@ interface StreamStats {
 }
 
 const App: React.FC = () => {
-  const [tab, setTab] = useState<'pairs' | 'manual'>('pairs');
+  const [view, setView] = useState<'dashboard' | 'session'>('dashboard');
+  const [sessionName, setSessionName] = useState('');
   const [pairs, setPairs] = useState<SavedPair[]>([]);
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState('');
@@ -58,10 +60,15 @@ const App: React.FC = () => {
   const [fullscreen, setFullscreen] = useState(false);
   const [hovering, setHovering] = useState(false);
   const [remoteCursor, setRemoteCursor] = useState<{ x: number; y: number } | null>(null);
+  const [freezeHint, setFreezeHint] = useState('');
   const peerRef = useRef<ClientPeer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cursorLogCountRef = useRef(0);
+  /** Intentos automáticos de input_reset de esta sesión (limitado: si el host
+   *  está congelado en un menú elevado de la bandeja, el reset no sirve de nada
+   *  y no tiene sentido inundar el canal con decenas de resets). */
+  const resetAttemptsRef = useRef(0);
   /** Throttle de moves: evita inundar el canal con decenas de puntos por segundo. */
   const moveTimerRef = useRef<number | undefined>(undefined);
   const pendingPointRef = useRef<{ x: number; y: number } | null>(null);
@@ -70,8 +77,35 @@ const App: React.FC = () => {
    *  así que el mapeo de coordenadas usa ESTE valor, no el del video. */
   const hostDisplayRef = useRef<{ width: number; height: number } | null>(null);
   const lastMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  /** Botones que el cliente cree pulsados. Mantiene el estado del host
+   *  consistente: si el `mouseup` se pierde (botón soltado fuera del video o
+   *  al perder foco la ventana), el host quedaría con el botón pulsado y su
+   *  mouse "arrastraría" en vez de moverse (mause trabado). */
+  const pressedMouseRef = useRef<Set<MouseButton>>(new Set());
+  /** Última vez que el usuario movió/hizo clic sobre el video. Se usa para
+   *  detectar un host congelado (muevo pero el cursor del host no responde). */
+  const lastLocalMouseAtRef = useRef(0);
+  /** Última posición del cursor del host y cuándo cambió (para el detector de
+   *  congelamiento: si muevo y el cursor del host no avanza, el host está atascado). */
+  const lastHostCursorPosRef = useRef<{ x: number; y: number } | null>(null);
+  const hostCursorMovedAtRef = useRef(0);
+  /** Evita mandar el input_reset en bucle (cooldown). */
+  const lastInputResetAtRef = useRef(0);
+  /** Acumulador de wheel: la rueda/trackpad genera decenas de eventos/segundo y
+   *  cada `scroll` cuesta ~200 ms al host (paso de rueda de nut-js); un flujo
+   *  sin control inunda el canal y la cola serializada del host (backlog de 130+
+   *  eventos = 30+s sin poder hacer nada). Acumulamos ~80 ms y enviamos un solo
+   *  evento con los deltas sumados. */
+  const wheelAccumRef = useRef({ dx: 0, dy: 0 });
+  const wheelTimerRef = useRef<number | undefined>(undefined);
   const everConnectedRef = useRef(false);
   const activePairIdRef = useRef<string | null>(null);
+  /** Parámetros de la última conexión, para la reconexión automática. */
+  const lastPeerParamsRef = useRef<{ c: string; p: string; s?: string } | null>(null);
+  const autoRetryRef = useRef(0);
+  const autoRetryTimerRef = useRef<number | null>(null);
+  /** El usuario pulsó Desconectar: no reconectar en automático. */
+  const manualDisconnectRef = useRef(false);
 
   /** Último valor del portapapeles local aplicado (evita ecos al sincronizar). */
   const lastClipboardRef = useRef<string | null>(null);
@@ -169,6 +203,7 @@ const App: React.FC = () => {
       if (!p) {
         return;
       }
+      lastLocalMouseAtRef.current = Date.now();
       setRemoteCursor(p);
       lastMouseRef.current = p;
       pendingPointRef.current = p;
@@ -193,9 +228,16 @@ const App: React.FC = () => {
       if (!p) {
         return;
       }
+      lastLocalMouseAtRef.current = Date.now();
       lastMouseRef.current = p;
       setRemoteCursor(p);
-      const button = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
+      const button: MouseButton = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
+      if (pressedMouseRef.current.has(button)) {
+        // Ya lo consideramos pulsado (p. ej. un down duplicado tras re-focus):
+        // reenviarlo dejaría al host con dos press sin el release correspondiente.
+        return;
+      }
+      pressedMouseRef.current.add(button);
       sendMouse({ type: 'move', x: p.x, y: p.y });
       sendMouse({ type: 'down', button, x: p.x, y: p.y });
       void videoRef.current?.focus();
@@ -205,23 +247,115 @@ const App: React.FC = () => {
 
   const handleMouseUp = useCallback(
     (e: React.MouseEvent<HTMLVideoElement>) => {
+      const button: MouseButton = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
       const p = toHostPoint(e.clientX, e.clientY);
-      if (!p) {
-        return;
+      lastLocalMouseAtRef.current = Date.now();
+      if (p) {
+        lastMouseRef.current = p;
+        setRemoteCursor(p);
+        sendMouse({ type: 'move', x: p.x, y: p.y });
       }
-      lastMouseRef.current = p;
-      setRemoteCursor(p);
-      const button = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
-      sendMouse({ type: 'move', x: p.x, y: p.y });
-      sendMouse({ type: 'up', button, x: p.x, y: p.y });
+      if (pressedMouseRef.current.delete(button)) {
+        sendMouse({ type: 'up', button, x: lastMouseRef.current.x, y: lastMouseRef.current.y });
+      }
     },
     [sendMouse, toHostPoint],
   );
 
+  /** Libera los botones que el cliente tiene pulsados (recuperación cuando el
+   *  `mouseup` no llega al video: botón soltado fuera de la ventana, blur, etc.) */
+  const releaseAllMouseButtons = useCallback(() => {
+    const pressed = pressedMouseRef.current;
+    if (pressed.size === 0) {
+      return;
+    }
+    const pos = lastMouseRef.current;
+    for (const button of [...pressed]) {
+      sendMouse({ type: 'up', button, x: pos.x, y: pos.y });
+    }
+    pressed.clear();
+  }, [sendMouse]);
+
+  /** Captura global del mouse: si el botón se suelta FUERA del área de video
+   *  (arrastrando hacia fuera de la ventana, sobre la barra de sesión, etc.) el
+   *  `onMouseUp` del elemento no se dispara y el host quedaría con el botón
+   *  pulsado (mause trabado). Escuchamos el `mouseup` y el `blur` a nivel de
+   *  ventana para garantizar que el host siempre reciba el `up`. */
+  useEffect(() => {
+    if (status !== 'connected') {
+      return;
+    }
+    const onWindowMouseUp = (e: MouseEvent): void => {
+      const button: MouseButton = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
+      if (pressedMouseRef.current.delete(button)) {
+        const pos = lastMouseRef.current;
+        sendMouse({ type: 'up', button, x: pos.x, y: pos.y });
+      }
+    };
+    const onWindowBlur = (): void => {
+      releaseAllMouseButtons();
+    };
+    window.addEventListener('mouseup', onWindowMouseUp);
+    window.addEventListener('blur', onWindowBlur);
+    return () => {
+      window.removeEventListener('mouseup', onWindowMouseUp);
+      window.removeEventListener('blur', onWindowBlur);
+    };
+  }, [sendMouse, releaseAllMouseButtons, status]);
+
+  /** Detector de host congelado: si el usuario mueve el mouse sobre el video y
+   *  el cursor del HOST no cambia de posición en ~2 s, la inyección del host se
+   *  atascó (botón pegado o llamada nativa colgada). Envío un `inputReset` para
+   *  que el host libere botones y reinicie la cola al instante, sin esperar su
+   *  reconcile interno. Con cooldown de 5 s para no inundar el canal. */
+  useEffect(() => {
+    if (status !== 'connected') {
+      return;
+    }
+    // Estado inicial limpio del detector de congelamiento por si se reconecta:
+    // sin esto, con hostCursorMovedAtRef=0 podría mandar un input_reset falso
+    // justo tras conectar.
+    hostCursorMovedAtRef.current = Date.now();
+    lastLocalMouseAtRef.current = 0;
+    resetAttemptsRef.current = 0;
+    setFreezeHint('');
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      const userMoving = now - lastLocalMouseAtRef.current < 1500;
+      const hostStuck = now - hostCursorMovedAtRef.current > 2000;
+      const cooldownOk = now - lastInputResetAtRef.current > 5000;
+      if (userMoving && hostStuck && cooldownOk && resetAttemptsRef.current < 3) {
+        lastInputResetAtRef.current = now;
+        resetAttemptsRef.current += 1;
+        console.log('[client] host sin respuesta del cursor mientras muevo; enviando input_reset');
+        send({ kind: 'control', payload: { kind: 'inputReset' } });
+        if (resetAttemptsRef.current >= 2) {
+          setFreezeHint(
+            'El host no responde: probablemente quedó un menú del sistema de Windows (bandeja/Task Manager) abierto. ' +
+              'Ciérralo con Escape en el host, o ejecuta el host como administrador.',
+          );
+          console.warn('[client] host congelado tras varios resets; probable menú elevado del sistema');
+        }
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [send, status]);
+
   const handleWheel = useCallback(
     (e: React.WheelEvent<HTMLVideoElement>) => {
       e.preventDefault();
-      sendMouse({ type: 'scroll', deltaX: e.deltaX, deltaY: e.deltaY });
+      wheelAccumRef.current.dx += e.deltaX;
+      wheelAccumRef.current.dy += e.deltaY;
+      if (wheelTimerRef.current === undefined) {
+        wheelTimerRef.current = window.setTimeout(() => {
+          wheelTimerRef.current = undefined;
+          const { dx, dy } = wheelAccumRef.current;
+          wheelAccumRef.current = { dx: 0, dy: 0 };
+          if (dx !== 0 || dy !== 0) {
+            sendMouse({ type: 'scroll', deltaX: dx, deltaY: dy });
+          }
+        }, 80);
+      }
     },
     [sendMouse],
   );
@@ -400,6 +534,8 @@ const App: React.FC = () => {
     const secs = window.isis.autostop;
     const timer = window.setTimeout(() => {
       console.log(`[client] autostop: requestDisconnect a los ${secs}s`);
+      // Es un cierre iniciado por nosotros: no reconectar en automático.
+      manualDisconnectRef.current = true;
       send({ kind: 'control', payload: { kind: 'requestDisconnect' } });
     }, secs * 1000);
     return () => window.clearTimeout(timer);
@@ -423,6 +559,10 @@ const App: React.FC = () => {
       if (!c) {
         return;
       }
+      setSessionName(pairName ?? c);
+      setView('session');
+      manualDisconnectRef.current = false;
+      lastPeerParamsRef.current = { c, p, s: secretArg };
       void (async () => {
         if (peerRef.current) {
           await peerRef.current.stop();
@@ -441,6 +581,7 @@ const App: React.FC = () => {
             setStatus(s);
             setDetail(d ? (ERROR_DETAIL[d] ?? d) : '');
             if (s === 'connected') {
+              autoRetryRef.current = 0;
               console.log(`[client] CONNECTED code=${c}${pairName ? ` team=${pairName}` : ''}`);
               if (activePairIdRef.current) {
                 void window.isis?.getPairs().then((list) => {
@@ -449,6 +590,27 @@ const App: React.FC = () => {
                     void window.isis?.savePair({ ...rec, lastConnectedAt: Date.now() });
                   }
                 });
+              }
+              return;
+            }
+            // Tras haber tenido una sesión buena, una caída del transporte se
+            // intenta en automático (la WebRTC se muere sola a veces: ICE
+            // limpy y sin candidatos se va a connection_failed). El usuario
+            // puede pulsar Reconectar (resetea el contador) o Desconectar.
+            if (
+              (s === 'ended' || s === 'error') &&
+              everConnectedRef.current &&
+              !manualDisconnectRef.current &&
+              autoRetryRef.current < 3
+            ) {
+              const params = lastPeerParamsRef.current;
+              if (params) {
+                autoRetryRef.current += 1;
+                console.log(`[client] auto_reconnect intento ${autoRetryRef.current}/3 en 1.5s`);
+                autoRetryTimerRef.current = window.setTimeout(() => {
+                  autoRetryTimerRef.current = null;
+                  connect(params.c, params.p, params.s);
+                }, 1500);
               }
             }
           },
@@ -465,6 +627,12 @@ const App: React.FC = () => {
               console.log(`[client] display_info ${msg.payload.width}x${msg.payload.height}`);
             } else if (msg.kind === 'cursor') {
               setRemoteCursor({ x: msg.payload.x, y: msg.payload.y });
+              const last = lastHostCursorPosRef.current;
+              if (!last || last.x !== msg.payload.x || last.y !== msg.payload.y) {
+                lastHostCursorPosRef.current = { x: msg.payload.x, y: msg.payload.y };
+                hostCursorMovedAtRef.current = Date.now();
+                setFreezeHint('');
+              }
               cursorLogCountRef.current += 1;
               if (cursorLogCountRef.current % 15 === 1) {
                 console.log(`[client] cursor_host ${msg.payload.x},${msg.payload.y}`);
@@ -495,6 +663,12 @@ const App: React.FC = () => {
   );
 
   const disconnect = useCallback(() => {
+    if (autoRetryTimerRef.current !== null) {
+      window.clearTimeout(autoRetryTimerRef.current);
+      autoRetryTimerRef.current = null;
+    }
+    manualDisconnectRef.current = true;
+    autoRetryRef.current = 0;
     void (async () => {
       await peerRef.current?.stop();
       peerRef.current = null;
@@ -502,6 +676,8 @@ const App: React.FC = () => {
       setStatus('idle');
       setDetail('');
       setRemoteStream(null);
+      setSessionName('');
+      setView('dashboard');
     })();
   }, []);
 
@@ -517,6 +693,13 @@ const App: React.FC = () => {
   const remoteActive = remoteStream && status === 'connected' && hovering;
   const cursorBox = remoteActive && remoteCursor ? toClientPoint(remoteCursor.x, remoteCursor.y) : null;
 
+  const handleConnectPair = useCallback(
+    (pair: SavedPair) => {
+      connect(pair.id, '', pair.secret, pair.name);
+    },
+    [connect],
+  );
+
   useEffect(() => {
     const args = window.isis;
     void (async () => {
@@ -531,19 +714,14 @@ const App: React.FC = () => {
       }
     })();
     return () => {
+      if (autoRetryTimerRef.current !== null) {
+        window.clearTimeout(autoRetryTimerRef.current);
+        autoRetryTimerRef.current = null;
+      }
       void peerRef.current?.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const busy = status === 'looking_up' || status === 'signaling' || status === 'connecting';
-
-  const handleConnectPair = useCallback(
-    (pair: SavedPair) => {
-      connect(pair.id, '', pair.secret, pair.name);
-    },
-    [connect],
-  );
 
   const handleSavePair = useCallback(() => {
     const id = normalizeKey(newId);
@@ -573,10 +751,146 @@ const App: React.FC = () => {
     [],
   );
 
-  return (
-    <div className="app">
-      <h1>IsisAnubis Client</h1>
-      <p className="muted">Equipo que controla (macOS).</p>
+  const formatLastConnected = (ts?: number): string => {
+    if (!ts) {
+      return 'Nunca conectado';
+    }
+    return `Última conexión: ${new Date(ts).toLocaleString()}`;
+  };
+
+  const dashboard = (
+    <div className="app dashboard">
+      <header className="dash-header">
+        <h1>IsisAnubis Client</h1>
+        <p className="muted">Tus equipos remotos</p>
+      </header>
+
+      {pairs.length === 0 && !showAdd && (
+        <p className="muted">
+          Todavía no tenés equipos emparejados. Agregá uno con el ID y secreto que muestra el host
+          en su panel "Emparejado".
+        </p>
+      )}
+
+      <div className="pairs-grid">
+        {pairs.map((pair) => (
+          <div
+            className="pair-card clickable"
+            key={pair.id}
+            role="button"
+            tabIndex={0}
+            onClick={() => handleConnectPair(pair)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handleConnectPair(pair);
+              }
+            }}
+          >
+            <div className="pair-card-info">
+              <span className="pair-card-name">{pair.name}</span>
+              <span className="pair-card-id">{pair.id}</span>
+              <span className="pair-card-last muted">{formatLastConnected(pair.lastConnectedAt)}</span>
+            </div>
+            <span className="pair-card-arrow" aria-hidden="true">
+              ▶
+            </span>
+            <button
+              type="button"
+              className="btn ghost remove"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleRemovePair(pair.id);
+              }}
+              title="Quitar equipo"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {showAdd && (
+        <div className="form">
+          <label className="field">
+            <span>Nombre del equipo</span>
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="p. ej. PC de escritorio"
+            />
+          </label>
+          <label className="field">
+            <span>ID del equipo (del panel del host)</span>
+            <input
+              value={newId}
+              onChange={(e) => setNewId(e.target.value)}
+              placeholder="8 caracteres"
+            />
+          </label>
+          <label className="field">
+            <span>Secreto (del panel del host)</span>
+            <input
+              type="password"
+              value={newSecret}
+              onChange={(e) => setNewSecret(e.target.value)}
+              placeholder="8 caracteres"
+            />
+          </label>
+          <div className="actions">
+            <button type="button" className="btn primary" onClick={handleSavePair}>
+              Guardar equipo
+            </button>
+            <button type="button" className="btn" onClick={() => setShowAdd(false)}>
+              Cancelar
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!showAdd && (
+        <button type="button" className="btn primary add-pair" onClick={() => setShowAdd(true)}>
+          + Añadir equipo
+        </button>
+      )}
+
+      <p className="pill dashboard-pill">
+        {STATUS_TOOLTIP[status]}
+        {detail && ` — ${detail}`}
+      </p>
+
+      <FirestoreStatus />
+    </div>
+  );
+
+  const session = (
+    <div className="app session">
+      <header className="session-bar">
+        <span className="session-name">{sessionName}</span>
+        <span className={`pill ${status}`}>
+          {STATUS_TOOLTIP[status]}
+          {detail && ` — ${detail}`}
+        </span>
+        {status === 'connected' && (
+          <button
+            type="button"
+            className="btn"
+            onClick={() => {
+              lastInputResetAtRef.current = Date.now();
+              console.log('[client] reiniciar input remoto (manual)');
+              send({ kind: 'control', payload: { kind: 'inputReset' } });
+            }}
+            title="Si el mouse remoto se queda congelado: libera botones y reinicia la cola de input del host"
+          >
+            Reiniciar input
+          </button>
+        )}
+        <button type="button" className="btn" onClick={disconnect}>
+          ← Volver
+        </button>
+      </header>
+
+      {freezeHint && <p className="pill warn session-hint">{freezeHint}</p>}
 
       <div
         ref={containerRef}
@@ -585,6 +899,7 @@ const App: React.FC = () => {
         onMouseLeave={() => {
           setHovering(false);
           setRemoteCursor(null);
+          releaseAllMouseButtons();
         }}
       >
         {remoteStream ? (
@@ -647,22 +962,32 @@ const App: React.FC = () => {
         {lostConnection && (
           <div className="lost-overlay">
             <p>Se perdió la conexión con la máquina remota.</p>
-            <button
-              type="button"
-              className="btn primary"
-              onClick={() => {
-                const pair = activePairIdRef.current
-                  ? pairs.find((x) => x.id === activePairIdRef.current)
-                  : undefined;
-                if (pair) {
-                  handleConnectPair(pair);
-                } else {
-                  connect();
-                }
-              }}
-            >
-              Reconectar
-            </button>
+            <div className="lost-actions">
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => {
+                  autoRetryRef.current = 0;
+                  if (autoRetryTimerRef.current !== null) {
+                    window.clearTimeout(autoRetryTimerRef.current);
+                    autoRetryTimerRef.current = null;
+                  }
+                  const pair = activePairIdRef.current
+                    ? pairs.find((x) => x.id === activePairIdRef.current)
+                    : undefined;
+                  if (pair) {
+                    handleConnectPair(pair);
+                  } else {
+                    connect();
+                  }
+                }}
+              >
+                Reconectar
+              </button>
+              <button type="button" className="btn" onClick={disconnect}>
+                Volver al inicio
+              </button>
+            </div>
           </div>
         )}
 
@@ -675,157 +1000,11 @@ const App: React.FC = () => {
         )}
       </div>
 
-      <div className="mode-tabs">
-        <button
-          type="button"
-          className={`mode-tab ${tab === 'pairs' ? 'active' : ''}`}
-          onClick={() => setTab('pairs')}
-        >
-          Mis equipos
-        </button>
-        <button
-          type="button"
-          className={`mode-tab ${tab === 'manual' ? 'active' : ''}`}
-          onClick={() => setTab('manual')}
-        >
-          Código
-        </button>
-        {status === 'connected' && (
-          <button type="button" className="btn danger small-inline" onClick={disconnect}>
-            Desconectar
-          </button>
-        )}
-      </div>
-
-      {tab === 'pairs' && (
-        <div className="pairs-view">
-          {pairs.length === 0 && !showAdd && (
-            <p className="muted">
-              Todavía no tenés equipos emparejados. Agregá uno con el ID y secreto que muestra el host
-              en su panel "Emparejado".
-            </p>
-          )}
-
-          {pairs.map((pair) => (
-            <div className="pair-card" key={pair.id}>
-              <div className="pair-card-info">
-                <span className="pair-card-name">{pair.name}</span>
-                <span className="pair-card-id">{pair.id}</span>
-              </div>
-              {status === 'connected' && activePairIdRef.current === pair.id ? (
-                <button type="button" className="btn danger" onClick={disconnect}>
-                  Desconectar
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="btn primary"
-                  onClick={() => handleConnectPair(pair)}
-                  disabled={busy}
-                >
-                  Conectar
-                </button>
-              )}
-              <button
-                type="button"
-                className="btn ghost"
-                onClick={() => handleRemovePair(pair.id)}
-                title="Quitar equipo"
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-
-          {showAdd && (
-            <div className="form">
-              <label className="field">
-                <span>Nombre del equipo</span>
-                <input
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  placeholder="p. ej. PC de escritorio"
-                />
-              </label>
-              <label className="field">
-                <span>ID del equipo (del panel del host)</span>
-                <input
-                  value={newId}
-                  onChange={(e) => setNewId(e.target.value)}
-                  placeholder="8 caracteres"
-                />
-              </label>
-              <label className="field">
-                <span>Secreto (del panel del host)</span>
-                <input
-                  type="password"
-                  value={newSecret}
-                  onChange={(e) => setNewSecret(e.target.value)}
-                  placeholder="8 caracteres"
-                />
-              </label>
-              <div className="actions">
-                <button type="button" className="btn primary" onClick={handleSavePair}>
-                  Guardar equipo
-                </button>
-                <button type="button" className="btn" onClick={() => setShowAdd(false)}>
-                  Cancelar
-                </button>
-              </div>
-            </div>
-          )}
-
-          {!showAdd && (
-            <button type="button" className="btn" onClick={() => setShowAdd(true)}>
-              + Añadir equipo
-            </button>
-          )}
-        </div>
-      )}
-
-      {tab === 'manual' && (
-        <div className="form">
-          <label className="field">
-            <span>Código de la máquina</span>
-            <input
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-              placeholder="p. ej. abc234"
-              disabled={busy}
-              autoFocus
-            />
-          </label>
-          <label className="field">
-            <span>PIN (si la máquina lo exige)</span>
-            <input
-              type="password"
-              value={pin}
-              onChange={(e) => setPin(e.target.value)}
-              placeholder="Opcional"
-              disabled={busy}
-            />
-          </label>
-          <div className="actions">
-            <button
-              type="button"
-              className="btn primary"
-              onClick={() => connect()}
-              disabled={!code.trim() || busy}
-            >
-              Conectar
-            </button>
-          </div>
-        </div>
-      )}
-
-      <p className={`pill ${status}`}>
-        {STATUS_TOOLTIP[status]}
-        {detail && ` — ${detail}`}
-      </p>
-
       <FirestoreStatus />
     </div>
   );
+
+  return view === 'session' ? session : dashboard;
 };
 
 export default App;
