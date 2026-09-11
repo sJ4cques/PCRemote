@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   FirestoreStatus,
+  APP_VERSION,
   generateSessionCode,
   getFirebaseDb,
   HostPeer,
@@ -230,9 +231,9 @@ const App: React.FC = () => {
   /**
    * Captura la pantalla real (Windows/macOS/Linux).
    *
-   * Orden: 1) getUserMedia legacy con chromeMediaSource (video SOLO; pedir audio
-   * de escritorio en la misma llamada rompe la captura de video en Windows);
-   * 2) si falla, getDisplayMedia (con setDisplayMediaRequestHandler en main).
+   * Preferimos getDisplayMedia porque Electron puede resolverlo desde main sin
+   * depender del picker ni del foco de la ventana oculta. Dejamos el camino
+   * legacy como fallback para versiones de Windows/Electron que lo requieran.
    */
   const captureScreenStream = useCallback(
     async ():
@@ -242,31 +243,6 @@ const App: React.FC = () => {
       > => {
     const platform = window.isis?.platform ?? 'darwin';
     const forceGdm = window.isis?.forceGetDisplayMedia === true;
-    if (!forceGdm) {
-      try {
-        const sourceId = await window.isis!.getScreenSourceId();
-        const chromeSource = platform === 'darwin' ? 'screen' : 'desktop';
-        const constraints = {
-          audio: false,
-          video: {
-            mandatory: {
-              chromeMediaSource: chromeSource,
-              chromeMediaSourceId: sourceId,
-              maxWidth: 1920,
-              maxHeight: 1080,
-              maxFrameRate: 30,
-            },
-          },
-        } as unknown as MediaStreamConstraints;
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        console.log(
-          `[host] capture_result video=${stream.getVideoTracks().length} audio=${stream.getAudioTracks().length} mode=legacy`,
-        );
-        return { stream, mode: 'legacy' };
-      } catch (errLegacy) {
-        console.warn('[host] captura legacy fallida; probando getDisplayMedia:', errLegacy);
-      }
-    }
     try {
       const stream = (await navigator.mediaDevices.getDisplayMedia({
         audio: false,
@@ -277,8 +253,36 @@ const App: React.FC = () => {
       );
       return { stream, mode: 'getDisplayMedia' };
     } catch (errGdm) {
-      const error = errGdm instanceof Error ? errGdm.message : String(errGdm);
-      console.error('[host] getDisplayMedia fallida:', errGdm);
+      if (forceGdm) {
+        const error = errGdm instanceof Error ? errGdm.message : String(errGdm);
+        console.error('[host] getDisplayMedia fallida (modo forzado):', errGdm);
+        return { stream: null, error };
+      }
+      console.warn('[host] getDisplayMedia fallida; probando captura legacy:', errGdm);
+    }
+    try {
+      const sourceId = await window.isis!.getScreenSourceId();
+      const chromeSource = platform === 'darwin' ? 'screen' : 'desktop';
+      const constraints = {
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: chromeSource,
+            chromeMediaSourceId: sourceId,
+            maxWidth: 1920,
+            maxHeight: 1080,
+            maxFrameRate: 30,
+          },
+        },
+      } as unknown as MediaStreamConstraints;
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      console.log(
+        `[host] capture_result video=${stream.getVideoTracks().length} audio=${stream.getAudioTracks().length} mode=legacy`,
+      );
+      return { stream, mode: 'legacy' };
+    } catch (errLegacy) {
+      const error = errLegacy instanceof Error ? errLegacy.message : String(errLegacy);
+      console.error('[host] captura de pantalla fallida en ambos modos:', errLegacy);
       return { stream: null, error };
     }
   }, []);
@@ -310,9 +314,8 @@ const App: React.FC = () => {
       if (msg.payload.kind === 'requestDisconnect') {
         void (peer ?? peerRef.current)?.stop();
       } else if (msg.payload.kind === 'inputReset') {
-        // El cliente detectó el host congelado (cursor sin respuesta): liberar
-        // botones pegados, despejar la cola y, si hay un menú/flyout del sistema
-        // abierto tragándose el input (menús elevados de bandeja/taskbar), cerrarlo.
+        // Recuperación explícita solicitada por el operador: liberar botones,
+        // despejar la cola y cerrar con Escape un menú que esté capturando input.
         console.log('[host] input_reset solicitado por el cliente');
         window.isis?.inputPanic();
       }
@@ -322,10 +325,12 @@ const App: React.FC = () => {
   const onChannelState = useCallback((open: boolean) => {
     console.log(`[host] channel_state=${open ? 'open' : 'closed'}`);
     channelOpenRef.current = open;
-    // Al cerrar (o al volver a abrir, p. ej. cliente nuevo) no dejamos botones
-    // presionados de la sesión anterior: si se perdió el `up` en el corte, el
-    // SO quedaría con el botón físico pulsado (mause trabado).
-    window.isis?.releaseInputButtons();
+    // Solo liberar al cerrar. Reiniciar el worker justo al abrir el canal crea
+    // una carrera con el primer movimiento/clic del cliente y puede alterar
+    // menús del sistema que todavía están abiertos.
+    if (!open) {
+      window.isis?.releaseInputButtons();
+    }
     if (open && displayInfoRef.current) {
       const { width, height } = displayInfoRef.current;
       peerRef.current?.send({ kind: 'display', payload: { width, height } });
@@ -521,6 +526,11 @@ const App: React.FC = () => {
       if (cfg) {
         setConfig(cfg);
         setDeviceName(cfg.deviceName);
+      }
+      const auto = await window.isis?.getAutostart();
+      if (auto !== undefined) {
+        setAutostart(auto);
+      } else if (cfg) {
         setAutostart(cfg.autostart);
       }
     })();
@@ -643,6 +653,7 @@ const App: React.FC = () => {
 
   return (
     <div className="app">
+      <span className="build-version">v{APP_VERSION}</span>
       <h1>IsisAnubis Host</h1>
       <p className="muted">Equipo controlado (Windows).</p>
 
@@ -803,7 +814,12 @@ const App: React.FC = () => {
       </p>
 
       <p className="muted">
-        Input: {window.isis?.fakeInput ? 'simulado (sin inyectar)' : 'inyección real'}
+        Input:{' '}
+        {window.isis?.fakeInput
+          ? 'simulado (sin inyectar)'
+          : window.isis?.platform === 'win32'
+            ? 'helper elevado separado'
+            : 'inyección real'}
       </p>
 
       <p className="muted">

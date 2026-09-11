@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ClientPeer,
+  APP_VERSION,
   FirestoreStatus,
   getFirebaseDb,
   normalizeKey,
@@ -43,6 +44,10 @@ interface StreamStats {
   frames?: number;
 }
 
+function toMouseButton(button: number): MouseButton {
+  return (['left', 'middle', 'right'] as const)[button] ?? 'left';
+}
+
 const App: React.FC = () => {
   const [view, setView] = useState<'dashboard' | 'session'>('dashboard');
   const [sessionName, setSessionName] = useState('');
@@ -60,15 +65,10 @@ const App: React.FC = () => {
   const [fullscreen, setFullscreen] = useState(false);
   const [hovering, setHovering] = useState(false);
   const [remoteCursor, setRemoteCursor] = useState<{ x: number; y: number } | null>(null);
-  const [freezeHint, setFreezeHint] = useState('');
   const peerRef = useRef<ClientPeer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cursorLogCountRef = useRef(0);
-  /** Intentos automáticos de input_reset de esta sesión (limitado: si el host
-   *  está congelado en un menú elevado de la bandeja, el reset no sirve de nada
-   *  y no tiene sentido inundar el canal con decenas de resets). */
-  const resetAttemptsRef = useRef(0);
   /** Throttle de moves: evita inundar el canal con decenas de puntos por segundo. */
   const moveTimerRef = useRef<number | undefined>(undefined);
   const pendingPointRef = useRef<{ x: number; y: number } | null>(null);
@@ -82,14 +82,10 @@ const App: React.FC = () => {
    *  al perder foco la ventana), el host quedaría con el botón pulsado y su
    *  mouse "arrastraría" en vez de moverse (mause trabado). */
   const pressedMouseRef = useRef<Set<MouseButton>>(new Set());
-  /** Última vez que el usuario movió/hizo clic sobre el video. Se usa para
-   *  detectar un host congelado (muevo pero el cursor del host no responde). */
+  /** Última vez que el usuario movió/hizo clic sobre el video. Se conserva
+   *  para mantener la secuencia de entrada y el diagnóstico local. */
   const lastLocalMouseAtRef = useRef(0);
-  /** Última posición del cursor del host y cuándo cambió (para el detector de
-   *  congelamiento: si muevo y el cursor del host no avanza, el host está atascado). */
-  const lastHostCursorPosRef = useRef<{ x: number; y: number } | null>(null);
-  const hostCursorMovedAtRef = useRef(0);
-  /** Evita mandar el input_reset en bucle (cooldown). */
+  /** Marca la última recuperación manual solicitada por el operador. */
   const lastInputResetAtRef = useRef(0);
   /** Acumulador de wheel: la rueda/trackpad genera decenas de eventos/segundo y
    *  cada `scroll` cuesta ~200 ms al host (paso de rueda de nut-js); un flujo
@@ -197,8 +193,20 @@ const App: React.FC = () => {
     [send],
   );
 
+  const flushPendingMove = useCallback(
+    (p: { x: number; y: number }): void => {
+      if (moveTimerRef.current !== undefined) {
+        window.clearTimeout(moveTimerRef.current);
+        moveTimerRef.current = undefined;
+      }
+      pendingPointRef.current = null;
+      sendMouse({ type: 'move', x: p.x, y: p.y });
+    },
+    [sendMouse],
+  );
+
   const handleMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLVideoElement>) => {
+    (e: React.PointerEvent<HTMLVideoElement>) => {
       const p = toHostPoint(e.clientX, e.clientY);
       if (!p) {
         return;
@@ -222,7 +230,7 @@ const App: React.FC = () => {
   );
 
   const handleMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLVideoElement>) => {
+    (e: React.PointerEvent<HTMLVideoElement>) => {
       e.preventDefault();
       const p = toHostPoint(e.clientX, e.clientY);
       if (!p) {
@@ -231,40 +239,61 @@ const App: React.FC = () => {
       lastLocalMouseAtRef.current = Date.now();
       lastMouseRef.current = p;
       setRemoteCursor(p);
-      const button: MouseButton = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
+      const button = toMouseButton(e.button);
       if (pressedMouseRef.current.has(button)) {
         // Ya lo consideramos pulsado (p. ej. un down duplicado tras re-focus):
         // reenviarlo dejaría al host con dos press sin el release correspondiente.
         return;
       }
       pressedMouseRef.current.add(button);
-      sendMouse({ type: 'move', x: p.x, y: p.y });
+      // El down debe seguir inmediatamente al move de la misma posición. Si
+      // queda un move pendiente del throttle, podría llegar después del down y
+      // desplazar el clic fuera del menú que el usuario estaba apuntando.
+      flushPendingMove(p);
       sendMouse({ type: 'down', button, x: p.x, y: p.y });
-      void videoRef.current?.focus();
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // Algunos WebViews no permiten capturar el puntero después de un menú.
+      }
+      e.currentTarget.focus();
     },
-    [sendMouse, toHostPoint],
+    [flushPendingMove, sendMouse, toHostPoint],
   );
 
   const handleMouseUp = useCallback(
-    (e: React.MouseEvent<HTMLVideoElement>) => {
-      const button: MouseButton = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
+    (e: React.PointerEvent<HTMLVideoElement>) => {
+      e.preventDefault();
+      const button = toMouseButton(e.button);
       const p = toHostPoint(e.clientX, e.clientY);
       lastLocalMouseAtRef.current = Date.now();
       if (p) {
         lastMouseRef.current = p;
         setRemoteCursor(p);
-        sendMouse({ type: 'move', x: p.x, y: p.y });
+        flushPendingMove(p);
       }
       if (pressedMouseRef.current.delete(button)) {
         sendMouse({ type: 'up', button, x: lastMouseRef.current.x, y: lastMouseRef.current.y });
       }
+      try {
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // El puntero ya pudo haber sido liberado por el WebView.
+      }
     },
-    [sendMouse, toHostPoint],
+    [flushPendingMove, sendMouse, toHostPoint],
   );
 
   /** Libera los botones que el cliente tiene pulsados (recuperación cuando el
    *  `mouseup` no llega al video: botón soltado fuera de la ventana, blur, etc.) */
   const releaseAllMouseButtons = useCallback(() => {
+    if (moveTimerRef.current !== undefined) {
+      window.clearTimeout(moveTimerRef.current);
+      moveTimerRef.current = undefined;
+    }
+    pendingPointRef.current = null;
     const pressed = pressedMouseRef.current;
     if (pressed.size === 0) {
       return;
@@ -276,6 +305,14 @@ const App: React.FC = () => {
     pressed.clear();
   }, [sendMouse]);
 
+  const handlePointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLVideoElement>) => {
+      e.preventDefault();
+      releaseAllMouseButtons();
+    },
+    [releaseAllMouseButtons],
+  );
+
   /** Captura global del mouse: si el botón se suelta FUERA del área de video
    *  (arrastrando hacia fuera de la ventana, sobre la barra de sesión, etc.) el
    *  `onMouseUp` del elemento no se dispara y el host quedaría con el botón
@@ -283,10 +320,11 @@ const App: React.FC = () => {
    *  ventana para garantizar que el host siempre reciba el `up`. */
   useEffect(() => {
     if (status !== 'connected') {
+      releaseAllMouseButtons();
       return;
     }
-    const onWindowMouseUp = (e: MouseEvent): void => {
-      const button: MouseButton = (['left', 'middle', 'right'] as const)[e.button] ?? 'left';
+    const onWindowPointerUp = (e: PointerEvent): void => {
+      const button = toMouseButton(e.button);
       if (pressedMouseRef.current.delete(button)) {
         const pos = lastMouseRef.current;
         sendMouse({ type: 'up', button, x: pos.x, y: pos.y });
@@ -295,51 +333,13 @@ const App: React.FC = () => {
     const onWindowBlur = (): void => {
       releaseAllMouseButtons();
     };
-    window.addEventListener('mouseup', onWindowMouseUp);
+    window.addEventListener('pointerup', onWindowPointerUp);
     window.addEventListener('blur', onWindowBlur);
     return () => {
-      window.removeEventListener('mouseup', onWindowMouseUp);
+      window.removeEventListener('pointerup', onWindowPointerUp);
       window.removeEventListener('blur', onWindowBlur);
     };
   }, [sendMouse, releaseAllMouseButtons, status]);
-
-  /** Detector de host congelado: si el usuario mueve el mouse sobre el video y
-   *  el cursor del HOST no cambia de posición en ~2 s, la inyección del host se
-   *  atascó (botón pegado o llamada nativa colgada). Envío un `inputReset` para
-   *  que el host libere botones y reinicie la cola al instante, sin esperar su
-   *  reconcile interno. Con cooldown de 5 s para no inundar el canal. */
-  useEffect(() => {
-    if (status !== 'connected') {
-      return;
-    }
-    // Estado inicial limpio del detector de congelamiento por si se reconecta:
-    // sin esto, con hostCursorMovedAtRef=0 podría mandar un input_reset falso
-    // justo tras conectar.
-    hostCursorMovedAtRef.current = Date.now();
-    lastLocalMouseAtRef.current = 0;
-    resetAttemptsRef.current = 0;
-    setFreezeHint('');
-    const timer = window.setInterval(() => {
-      const now = Date.now();
-      const userMoving = now - lastLocalMouseAtRef.current < 1500;
-      const hostStuck = now - hostCursorMovedAtRef.current > 2000;
-      const cooldownOk = now - lastInputResetAtRef.current > 5000;
-      if (userMoving && hostStuck && cooldownOk && resetAttemptsRef.current < 3) {
-        lastInputResetAtRef.current = now;
-        resetAttemptsRef.current += 1;
-        console.log('[client] host sin respuesta del cursor mientras muevo; enviando input_reset');
-        send({ kind: 'control', payload: { kind: 'inputReset' } });
-        if (resetAttemptsRef.current >= 2) {
-          setFreezeHint(
-            'El host no responde: probablemente quedó un menú del sistema de Windows (bandeja/Task Manager) abierto. ' +
-              'Ciérralo con Escape en el host, o ejecuta el host como administrador.',
-          );
-          console.warn('[client] host congelado tras varios resets; probable menú elevado del sistema');
-        }
-      }
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [send, status]);
 
   const handleWheel = useCallback(
     (e: React.WheelEvent<HTMLVideoElement>) => {
@@ -627,12 +627,6 @@ const App: React.FC = () => {
               console.log(`[client] display_info ${msg.payload.width}x${msg.payload.height}`);
             } else if (msg.kind === 'cursor') {
               setRemoteCursor({ x: msg.payload.x, y: msg.payload.y });
-              const last = lastHostCursorPosRef.current;
-              if (!last || last.x !== msg.payload.x || last.y !== msg.payload.y) {
-                lastHostCursorPosRef.current = { x: msg.payload.x, y: msg.payload.y };
-                hostCursorMovedAtRef.current = Date.now();
-                setFreezeHint('');
-              }
               cursorLogCountRef.current += 1;
               if (cursorLogCountRef.current % 15 === 1) {
                 console.log(`[client] cursor_host ${msg.payload.x},${msg.payload.y}`);
@@ -669,6 +663,7 @@ const App: React.FC = () => {
     }
     manualDisconnectRef.current = true;
     autoRetryRef.current = 0;
+    releaseAllMouseButtons();
     void (async () => {
       await peerRef.current?.stop();
       peerRef.current = null;
@@ -679,7 +674,7 @@ const App: React.FC = () => {
       setSessionName('');
       setView('dashboard');
     })();
-  }, []);
+  }, [releaseAllMouseButtons]);
 
   useEffect(() => {
     if (status === 'connected') {
@@ -760,6 +755,7 @@ const App: React.FC = () => {
 
   const dashboard = (
     <div className="app dashboard">
+      <span className="build-version">v{APP_VERSION}</span>
       <header className="dash-header">
         <h1>IsisAnubis Client</h1>
         <p className="muted">Tus equipos remotos</p>
@@ -865,6 +861,7 @@ const App: React.FC = () => {
 
   const session = (
     <div className="app session">
+      <span className="build-version">v{APP_VERSION}</span>
       <header className="session-bar">
         <span className="session-name">{sessionName}</span>
         <span className={`pill ${status}`}>
@@ -890,7 +887,6 @@ const App: React.FC = () => {
         </button>
       </header>
 
-      {freezeHint && <p className="pill warn session-hint">{freezeHint}</p>}
 
       <div
         ref={containerRef}
@@ -909,9 +905,10 @@ const App: React.FC = () => {
             playsInline
             className="remote-video"
             tabIndex={-1}
-            onMouseMove={handleMouseMove}
-            onMouseDown={handleMouseDown}
-            onMouseUp={handleMouseUp}
+            onPointerMove={handleMouseMove}
+            onPointerDown={handleMouseDown}
+            onPointerUp={handleMouseUp}
+            onPointerCancel={handlePointerCancel}
             onWheel={handleWheel}
             onContextMenu={handleContextMenu}
             onLoadedMetadata={(e) => {

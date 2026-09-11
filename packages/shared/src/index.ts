@@ -1,4 +1,5 @@
 export { firebaseConfig, FIRESTORE_COLLECTION, type FirebaseConfig } from "./config";
+export { APP_VERSION } from "./version";
 export { getFirebaseDb, pingFirestore } from "./firebase";
 export { FirestoreStatus, type FirestoreStatusValue } from "./FirestoreStatus";
 export {

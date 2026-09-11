@@ -4,6 +4,14 @@ import type { DataChannelMessage, KeyEvent, MouseButton } from '@isisanubis/shar
 /** Si está activo, registramos los inputs sin inyectarlos (pruebas/CI). */
 export const FAKE_INPUT = process.argv.includes('--isis-fake-input');
 
+// nut-js espera 100 ms por defecto después de cada movimiento y cada evento de
+// botón. En una sesión remota eso crea una cola artificial: el cliente puede
+// enviar puntos cada 25 ms y un clic termina aplicándose cientos de ms tarde,
+// especialmente visible en flyouts y menús del taskbar. La serialización ya la
+// controla input-worker, por lo que aquí no necesitamos esa demora.
+mouse.config.autoDelayMs = 0;
+keyboard.config.autoDelayMs = 0;
+
 type InputLog = (line: string) => void;
 
 let realMoveCount = 0;
@@ -14,22 +22,36 @@ const MOVE_LOG_EVERY = 25;
  *  estados inconsistentes. */
 const pressedButtons = new Set<MouseButton>();
 
+let resetPromise: Promise<void> | null = null;
+
 /** Libera todos los botones del mouse (recuperación tras una operación colgada:
  *  si un press quedó sin release, el SO considera el botón pulsado y los clics
  *  siguientes "arrastran" en lugar de hacer clic). */
 export async function resetMouseButtons(log: InputLog = (l) => console.log(l)): Promise<void> {
-  const hadPressed = pressedButtons.size > 0;
-  for (const b of [Button.LEFT, Button.MIDDLE, Button.RIGHT]) {
-    try {
-      await mouse.releaseButton(b);
-    } catch {
-      // si ya está suelto, no importa
+  if (FAKE_INPUT) {
+    pressedButtons.clear();
+    return;
+  }
+  if (resetPromise) {
+    return resetPromise;
+  }
+  resetPromise = (async () => {
+    const hadPressed = pressedButtons.size > 0;
+    for (const b of [Button.LEFT, Button.MIDDLE, Button.RIGHT]) {
+      try {
+        await mouse.releaseButton(b);
+      } catch {
+        // si ya está suelto, no importa
+      }
     }
-  }
-  pressedButtons.clear();
-  if (hadPressed) {
-    log('[input] reset_buttons (recuperación: botones colgados)');
-  }
+    pressedButtons.clear();
+    if (hadPressed) {
+      log('[input] reset_buttons (recuperación: botones colgados)');
+    }
+  })().finally(() => {
+    resetPromise = null;
+  });
+  return resetPromise;
 }
 
 /** true si el host cree tener algún botón pulsado (para la reconciliación). */
@@ -165,22 +187,12 @@ export async function handleInputMessage(
             } catch {
               // ignorar
             }
+            pressedButtons.delete(name);
             break;
           }
-          pressedButtons.add(name);
           await mouse.pressButton(btn);
+          pressedButtons.add(name);
           log(`[input] mouse_down ${a.button}@${Math.round(a.x)},${Math.round(a.y)}`);
-          // Micro-movimiento de 1px tras el press: Los flyouts/menús del sistema
-          // de Windows 11 (bandeja "^", taskbar, centro de notificaciones) son
-          // superficies XAML que IGNORAN un clic si el puntero no genera un
-          // evento de movimiento durante el press. Un cambio de 1px (bajo el
-          // umbral de arrastre) hace que el clic se registre sin convertirlo en
-          // drag. Para apps normales del escritorio es imperceptible.
-          try {
-            await mouse.setPosition(new Point(Math.round(a.x) + 1, Math.round(a.y)));
-          } catch {
-            // ignorar; el siguiente move real del cliente lo sobreescribe
-          }
           break;
         }
         case 'up': {

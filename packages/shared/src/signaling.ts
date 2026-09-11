@@ -448,12 +448,23 @@ export class HostPeer {
       this.flushPendingCandidates();
 
       if (!this.screenStream && this.getScreenStream) {
-        try {
-          this.screenStream = await this.getScreenStream();
-        } catch (err) {
-          console.warn(`[HostPeer/${this.code}] getScreenStream error:`, err);
-          this.screenStream = null;
+        // En un arranque manual Windows puede tardar un momento en publicar la
+        // fuente de escritorio. No contestamos una oferta sin video, porque el
+        // cliente quedaría "conectado" pero mostrando una pantalla vacía.
+        for (let attempt = 1; attempt <= 3 && !this.screenStream; attempt += 1) {
+          try {
+            this.screenStream = await this.getScreenStream();
+          } catch (err) {
+            console.warn(`[HostPeer/${this.code}] getScreenStream attempt=${attempt} error:`, err);
+            this.screenStream = null;
+          }
+          if (!this.screenStream && attempt < 3) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+          }
         }
+      }
+      if (this.getScreenStream && !this.screenStream) {
+        throw new Error('screen_stream_unavailable');
       }
       if (this.screenStream) {
         const existing = new Set(this.pc.getSenders().map((s) => s.track));
