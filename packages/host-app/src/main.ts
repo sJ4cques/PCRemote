@@ -358,8 +358,10 @@ app.whenReady().then(async () => {
 /** Nombre de la tarea programada de autostart. */
 const AUTOSTART_TASK_NAME = 'IsisAnubis Host';
 const INPUT_AUTOSTART_TASK_NAME = 'IsisAnubis Input';
-const HOST_LAUNCHER_NAME = 'isisanubis-host.cmd';
-const INPUT_HELPER_LAUNCHER_NAME = 'isisanubis-input-helper.cmd';
+const HOST_LEGACY_LAUNCHER_NAME = 'isisanubis-host.cmd';
+const INPUT_HELPER_LEGACY_LAUNCHER_NAME = 'isisanubis-input-helper.cmd';
+const HOST_HIDDEN_LAUNCHER_NAME = 'isisanubis-host.vbs';
+const INPUT_HELPER_HIDDEN_LAUNCHER_NAME = 'isisanubis-input-helper.vbs';
 const HOST_TASK_XML_NAME = 'isisanubis-host-task.xml';
 const INPUT_HELPER_TASK_XML_NAME = 'isisanubis-input-task.xml';
 // El helper puede arrancar antes que el host y bajo otro token de Windows.
@@ -370,25 +372,21 @@ const INPUT_HELPER_PORT = 47831;
 let inputHelperTaskRequested = false;
 let lastInputHelperTaskRunAt = 0;
 
-/**
- * SCHTASKS recibe /TR como una sola cadena. Pasarle directamente
- * `"IsisAnubis Host.exe" --isis-input-helper` hace que algunas versiones de
- * Windows interpreten el argumento de Electron como una opción de SCHTASKS.
- * Un .cmd estable deja los argumentos dentro de la acción de la tarea y,
- * además, sigue apuntando al ejecutable vigente después de una actualización.
- */
-function ensureTaskLauncher(name: string, executable: string, args: string[]): string {
+/** Ejecuta el binario directamente mediante Windows Script Host sin crear una
+ *  consola visible ni interponer cmd.exe. */
+function ensureHiddenTaskLauncher(name: string, executable: string, args: string[]): string {
   const launcherPath = path.join(app.getPath('userData'), name);
-  const batchExecutable = executable.replaceAll('%', '%%');
-  const batchArgs = args
-    .map((arg) => `"${arg.replaceAll('%', '%%').replaceAll('"', '""')}"`)
-    .join(' ');
+  const commandLine = [
+    `"${executable.replaceAll('"', '""')}"`,
+    ...args.map((arg) => `"${arg.replaceAll('"', '""')}"`),
+  ].join(' ');
+  const escapedCommandLine = commandLine.replaceAll('"', '""');
   const contents = [
-    '@echo off',
-    // Ejecutar directamente mantiene el proceso asociado a la tarea; `start`
-    // devolvería el control a SCHTASKS antes de que el helper quedara listo.
-    `"${batchExecutable}"${batchArgs ? ` ${batchArgs}` : ''}`,
-    'exit /b 0',
+    'Option Explicit',
+    'Dim shell',
+    'Set shell = CreateObject("WScript.Shell")',
+    `shell.Run "${escapedCommandLine}", 0, True`,
+    'Set shell = Nothing',
     '',
   ].join('\r\n');
   fs.mkdirSync(path.dirname(launcherPath), { recursive: true });
@@ -396,8 +394,39 @@ function ensureTaskLauncher(name: string, executable: string, args: string[]): s
   return launcherPath;
 }
 
-function ensureInputHelperLauncher(executable: string): string {
-  return ensureTaskLauncher(INPUT_HELPER_LAUNCHER_NAME, executable, ['--isis-input-helper']);
+/** Compatibilidad con tareas viejas: el .cmd solo dispara WScript oculto y
+ *  termina de inmediato, por lo que nunca queda una consola abierta. */
+function ensureLegacyLauncher(name: string, hiddenLauncherPath: string): void {
+  const launcherPath = path.join(app.getPath('userData'), name);
+  const wscriptExecutable = path.join(
+    process.env.SystemRoot ?? 'C:\\Windows',
+    'System32',
+    'wscript.exe',
+  );
+  const contents = [
+    '@echo off',
+    `start "" /b "${wscriptExecutable}" //nologo "${hiddenLauncherPath}"`,
+    'exit /b 0',
+    '',
+  ].join('\r\n');
+  fs.mkdirSync(path.dirname(launcherPath), { recursive: true });
+  fs.writeFileSync(launcherPath, contents, 'utf8');
+}
+
+function ensureHiddenInputHelperLauncher(executable: string): string {
+  const hiddenLauncher = ensureHiddenTaskLauncher(
+    INPUT_HELPER_HIDDEN_LAUNCHER_NAME,
+    executable,
+    ['--isis-input-helper'],
+  );
+  ensureLegacyLauncher(INPUT_HELPER_LEGACY_LAUNCHER_NAME, hiddenLauncher);
+  return hiddenLauncher;
+}
+
+function ensureHiddenHostLauncher(executable: string, args: string[]): string {
+  const hiddenLauncher = ensureHiddenTaskLauncher(HOST_HIDDEN_LAUNCHER_NAME, executable, args);
+  ensureLegacyLauncher(HOST_LEGACY_LAUNCHER_NAME, hiddenLauncher);
+  return hiddenLauncher;
 }
 
 function xmlEscape(value: string): string {
@@ -411,20 +440,21 @@ function xmlEscape(value: string): string {
 
 /**
  * Registra la tarea usando XML para que SCHTASKS no vuelva a interpretar los
- * argumentos de Electron como opciones de su propio comando. La acción llama
- * a cmd.exe, que ejecuta el .cmd estable generado arriba; así una actualización
- * de Squirrel solo requiere actualizar ese lanzador, no la tarea de Windows.
+ * argumentos de Electron como opciones de su propio comando. La tarea del
+ * host y la del helper usan wscript.exe para ejecutar directamente el binario
+ * sin consola visible; así una actualización de Squirrel solo requiere
+ * actualizar el lanzador, no la tarea de Windows.
  */
 function ensureTaskDefinition(
   name: string,
   launcherPath: string,
   runLevel: 'LeastPrivilege' | 'HighestAvailable',
+  action: { command: string; argumentsText: string },
   userId?: string,
   multipleInstancesPolicy: 'IgnoreNew' | 'StopExisting' = 'IgnoreNew',
 ): string {
   const definitionPath = path.join(app.getPath('userData'), name);
-  const command = process.env.ComSpec ?? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'cmd.exe');
-  const argumentsText = `/d /s /c ""${launcherPath}""`;
+  const { command, argumentsText } = action;
   const xml = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -445,6 +475,7 @@ function ensureTaskDefinition(
   </Principals>
   <Settings>
     <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <MultipleInstancesPolicy>${multipleInstancesPolicy}</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
@@ -528,23 +559,44 @@ async function refreshAutostartTaskDefinitions(): Promise<void> {
     const identity = await runCmd('whoami');
     const userId = identity.output.trim() || undefined;
     const hostLauncher = fs.existsSync(updateExecutable)
-      ? ensureTaskLauncher(HOST_LAUNCHER_NAME, updateExecutable, [
+      ? ensureHiddenHostLauncher(updateExecutable, [
           '--processStart',
           path.basename(currentExecutable),
         ])
-      : ensureTaskLauncher(HOST_LAUNCHER_NAME, currentExecutable, []);
-    const helperLauncher = ensureInputHelperLauncher(currentExecutable);
-    const hostXml = ensureTaskDefinition(HOST_TASK_XML_NAME, hostLauncher, 'LeastPrivilege', userId);
+      : ensureHiddenHostLauncher(currentExecutable, []);
+    const helperLauncher = ensureHiddenInputHelperLauncher(currentExecutable);
+    const wscriptExecutable = path.join(
+      process.env.SystemRoot ?? 'C:\\Windows',
+      'System32',
+      'wscript.exe',
+    );
+    const hostXml = ensureTaskDefinition(
+      HOST_TASK_XML_NAME,
+      hostLauncher,
+      'LeastPrivilege',
+      { command: wscriptExecutable, argumentsText: `"${hostLauncher}"` },
+      userId,
+      'IgnoreNew',
+    );
     const helperXml = ensureTaskDefinition(
       INPUT_HELPER_TASK_XML_NAME,
       helperLauncher,
       'HighestAvailable',
+      { command: wscriptExecutable, argumentsText: `"${helperLauncher}"` },
       userId,
       'StopExisting',
     );
+    // La instancia actual puede haber sido lanzada por esta misma tarea. La
+    // eliminación no termina el proceso activo, pero permite reemplazar la
+    // acción antigua que apuntaba directamente a cmd.exe.
+    await runCmd(`schtasks /Delete /F /TN "${AUTOSTART_TASK_NAME}"`);
     const hostResult = await runCmd(
       `schtasks /Create /F /TN "${AUTOSTART_TASK_NAME}" /XML "${hostXml}"`,
     );
+    // Una tarea activa puede rechazar /Create /F. Detener solo el helper
+    // permite reemplazar el lanzador anterior por el wrapper oculto.
+    await runCmd(`schtasks /End /TN "${INPUT_AUTOSTART_TASK_NAME}"`);
+    await runCmd(`schtasks /Delete /F /TN "${INPUT_AUTOSTART_TASK_NAME}"`);
     const helperResult = await runCmd(
       `schtasks /Create /F /TN "${INPUT_AUTOSTART_TASK_NAME}" /XML "${helperXml}"`,
     );
@@ -583,28 +635,39 @@ async function applyAutostart(on: boolean): Promise<{ ok: boolean; error?: strin
     const identity = await runCmd('whoami');
     const userId = identity.output.trim() || undefined;
     const hostLauncher = fs.existsSync(updateExecutable)
-      ? ensureTaskLauncher(HOST_LAUNCHER_NAME, updateExecutable, [
+      ? ensureHiddenHostLauncher(updateExecutable, [
           '--processStart',
           path.basename(currentExecutable),
         ])
-      : ensureTaskLauncher(HOST_LAUNCHER_NAME, currentExecutable, []);
+      : ensureHiddenHostLauncher(currentExecutable, []);
+    const wscriptExecutable = path.join(
+      process.env.SystemRoot ?? 'C:\\Windows',
+      'System32',
+      'wscript.exe',
+    );
     const hostTaskXml = ensureTaskDefinition(
       HOST_TASK_XML_NAME,
       hostLauncher,
       'LeastPrivilege',
+      { command: wscriptExecutable, argumentsText: `"${hostLauncher}"` },
       userId,
+      'IgnoreNew',
     );
+    await runCmd(`schtasks /Delete /F /TN "${AUTOSTART_TASK_NAME}"`);
     const hostTask = await runCmd(
       `schtasks /Create /F /TN "${AUTOSTART_TASK_NAME}" /XML "${hostTaskXml}"`,
     );
     let helperTask = hostTask;
     if (hostTask.ok) {
       try {
-        const helperLauncher = ensureInputHelperLauncher(currentExecutable);
+        await runCmd(`schtasks /End /TN "${INPUT_AUTOSTART_TASK_NAME}"`);
+        await runCmd(`schtasks /Delete /F /TN "${INPUT_AUTOSTART_TASK_NAME}"`);
+        const helperLauncher = ensureHiddenInputHelperLauncher(currentExecutable);
         const helperTaskXml = ensureTaskDefinition(
           INPUT_HELPER_TASK_XML_NAME,
           helperLauncher,
           'HighestAvailable',
+          { command: wscriptExecutable, argumentsText: `"${helperLauncher}"` },
           userId,
           'StopExisting',
         );
@@ -636,6 +699,7 @@ async function applyAutostart(on: boolean): Promise<{ ok: boolean; error?: strin
     appendLog(`[host] autostart ON falló al crear tareas: ${error}`);
     return { ok: false, error };
   }
+  await runCmd(`schtasks /End /TN "${INPUT_AUTOSTART_TASK_NAME}"`);
   const hostTask = await runCmd(`schtasks /Delete /F /TN "${AUTOSTART_TASK_NAME}"`);
   const helperTask = await runCmd(`schtasks /Delete /F /TN "${INPUT_AUTOSTART_TASK_NAME}"`);
   const ok = (hostTask.ok || isMissingTask(hostTask)) && (helperTask.ok || isMissingTask(helperTask));
@@ -806,16 +870,16 @@ function connectInputHelper(): void {
     inputHelperTaskRequested = true;
     lastInputHelperTaskRunAt = Date.now();
     try {
-      // Actualiza el .cmd con el ejecutable de la versión instalada antes de
-      // ejecutar la tarea persistente creada por el instalador/configuración.
-      ensureInputHelperLauncher(process.execPath);
+      // Actualiza el wrapper VBS con el ejecutable de la versión instalada
+      // antes de ejecutar la tarea persistente.
+      ensureHiddenInputHelperLauncher(process.execPath);
     } catch (err) {
       appendLog(`[host] no se pudo actualizar lanzador del input helper: ${String(err)}`);
     }
     const taskName = `"${INPUT_AUTOSTART_TASK_NAME}"`;
     // /Run no reemplaza una instancia antigua si la tarea anterior quedó
     // ejecutándose. Terminarla primero permite que Windows cargue el helper
-    // actual desde el .cmd recién actualizado.
+    // actual desde el wrapper VBS recién actualizado.
     void runCmd(`schtasks /End /TN ${taskName}`).then((endResult) => {
       if (!endResult.ok && !/no se está ejecutando|not running|cannot find/i.test(endResult.output)) {
         appendLog(`[host] no se pudo detener helper anterior: ${endResult.output}`);
