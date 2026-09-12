@@ -22,6 +22,8 @@ declare global {
       autostop?: number;
       /** Si se lanza con --isis-pair=<hostId>,<secret>, conecta directo a un host emparejado. */
       pair?: { id: string; secret: string };
+      /** Si se lanza con --isis-audio-only, conecta en modo "solo bocina" (sin video ni control). */
+      audioOnly?: boolean;
       /** Lee el texto del portapapeles del sistema. */
       readClipboard: () => Promise<string>;
       /** Escribe el texto en el portapapeles del sistema. */

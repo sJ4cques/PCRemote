@@ -64,6 +64,7 @@ const App: React.FC = () => {
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [hovering, setHovering] = useState(false);
+  const [audioOnlySession, setAudioOnlySession] = useState(false);
   const [remoteCursor, setRemoteCursor] = useState<{ x: number; y: number } | null>(null);
   const peerRef = useRef<ClientPeer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -97,11 +98,14 @@ const App: React.FC = () => {
   const everConnectedRef = useRef(false);
   const activePairIdRef = useRef<string | null>(null);
   /** Parámetros de la última conexión, para la reconexión automática. */
-  const lastPeerParamsRef = useRef<{ c: string; p: string; s?: string } | null>(null);
+  const lastPeerParamsRef = useRef<{ c: string; p: string; s?: string; audioOnly?: boolean } | null>(null);
   const autoRetryRef = useRef(0);
   const autoRetryTimerRef = useRef<number | null>(null);
   /** El usuario pulsó Desconectar: no reconectar en automático. */
   const manualDisconnectRef = useRef(false);
+  /** Sesión "solo bocina": se recibe solo audio, sin control remoto. */
+  const audioOnlyRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   /** Último valor del portapapeles local aplicado (evita ecos al sincronizar). */
   const lastClipboardRef = useRef<string | null>(null);
@@ -367,7 +371,7 @@ const App: React.FC = () => {
   // --- Envío de teclado ------------------------------------------------
 
   useEffect(() => {
-    if (status !== 'connected') {
+    if (status !== 'connected' || audioOnlyRef.current) {
       return;
     }
     const onKeyDown = (e: KeyboardEvent): void => {
@@ -400,7 +404,7 @@ const App: React.FC = () => {
   // --- Portapapeles (sincronización bidireccional) ------------------------
 
   useEffect(() => {
-    if (status !== 'connected') {
+    if (status !== 'connected' || audioOnlyRef.current) {
       return;
     }
     let cancelled = false;
@@ -552,8 +556,24 @@ const App: React.FC = () => {
     }
   }, [remoteStream]);
 
+  // En modo "solo bocina" el audio se reproduce con un <audio> oculto (no hay
+  // pista de video). Autoplay permitido por el flag del proceso main.
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) {
+      return;
+    }
+    if (audioOnlyRef.current && remoteStream) {
+      audio.srcObject = remoteStream;
+      void audio.play().catch(() => undefined);
+    }
+    if (audioOnlyRef.current && !remoteStream) {
+      audio.srcObject = null;
+    }
+  }, [remoteStream]);
+
   const connect = useCallback(
-    (codeArg?: string, pinArg?: string, secretArg?: string, pairName?: string) => {
+    (codeArg?: string, pinArg?: string, secretArg?: string, pairName?: string, audioOnly?: boolean) => {
       const c = (secretArg ? normalizeKey(codeArg ?? '') : (codeArg ?? code).trim().toLowerCase()).trim();
       const p = pinArg ?? pin;
       if (!c) {
@@ -561,8 +581,10 @@ const App: React.FC = () => {
       }
       setSessionName(pairName ?? c);
       setView('session');
+      audioOnlyRef.current = Boolean(audioOnly ?? audioOnlyRef.current);
+      setAudioOnlySession(audioOnlyRef.current);
       manualDisconnectRef.current = false;
-      lastPeerParamsRef.current = { c, p, s: secretArg };
+      lastPeerParamsRef.current = { c, p, s: secretArg, audioOnly: audioOnlyRef.current };
       void (async () => {
         if (peerRef.current) {
           await peerRef.current.stop();
@@ -576,6 +598,7 @@ const App: React.FC = () => {
           deviceName: 'Client',
           pin: p || undefined,
           secret: secretArg,
+          audioOnly: Boolean(audioOnly),
           onStatus: (s, d) => {
             console.log(`[client] status=${s}${d ? ` detail=${d}` : ''}`);
             setStatus(s);
@@ -609,7 +632,7 @@ const App: React.FC = () => {
                 console.log(`[client] auto_reconnect intento ${autoRetryRef.current}/3 en 1.5s`);
                 autoRetryTimerRef.current = window.setTimeout(() => {
                   autoRetryTimerRef.current = null;
-                  connect(params.c, params.p, params.s);
+                  connect(params.c, params.p, params.s, undefined, params.audioOnly);
                 }, 1500);
               }
             }
@@ -668,6 +691,8 @@ const App: React.FC = () => {
       await peerRef.current?.stop();
       peerRef.current = null;
       activePairIdRef.current = null;
+      audioOnlyRef.current = false;
+      setAudioOnlySession(false);
       setStatus('idle');
       setDetail('');
       setRemoteStream(null);
@@ -687,10 +712,18 @@ const App: React.FC = () => {
 
   const remoteActive = remoteStream && status === 'connected' && hovering;
   const cursorBox = remoteActive && remoteCursor ? toClientPoint(remoteCursor.x, remoteCursor.y) : null;
+  const remoteHasAudio = Boolean(remoteStream?.getAudioTracks().length);
 
   const handleConnectPair = useCallback(
     (pair: SavedPair) => {
       connect(pair.id, '', pair.secret, pair.name);
+    },
+    [connect],
+  );
+
+  const handleConnectAudio = useCallback(
+    (pair: SavedPair) => {
+      connect(pair.id, '', pair.secret, pair.name, true);
     },
     [connect],
   );
@@ -703,9 +736,9 @@ const App: React.FC = () => {
         if (args.pin) {
           setPin(args.pin);
         }
-        connect(args.code, args.pin);
+        connect(args.code, args.pin, undefined, undefined, args.audioOnly);
       } else if (args?.pair) {
-        connect(args.pair.id, '', args.pair.secret, args.pair.id);
+        connect(args.pair.id, '', args.pair.secret, args.pair.id, args.audioOnly);
       }
     })();
     return () => {
@@ -753,6 +786,43 @@ const App: React.FC = () => {
     return `Última conexión: ${new Date(ts).toLocaleString()}`;
   };
 
+  /** Overlay de "se perdió la conexión" (compartido por las vistas video y solo-audio). */
+  const lostOverlay = lostConnection && (
+    <div className="lost-overlay">
+      <p>Se perdió la conexión con la máquina remota.</p>
+      <div className="lost-actions">
+        <button
+          type="button"
+          className="btn primary"
+          onClick={() => {
+            autoRetryRef.current = 0;
+            if (autoRetryTimerRef.current !== null) {
+              window.clearTimeout(autoRetryTimerRef.current);
+              autoRetryTimerRef.current = null;
+            }
+            const pair = activePairIdRef.current
+              ? pairs.find((x) => x.id === activePairIdRef.current)
+              : undefined;
+            if (pair) {
+              if (audioOnlyRef.current) {
+                handleConnectAudio(pair);
+              } else {
+                handleConnectPair(pair);
+              }
+            } else {
+              connect();
+            }
+          }}
+        >
+          Reconectar
+        </button>
+        <button type="button" className="btn" onClick={disconnect}>
+          Volver al inicio
+        </button>
+      </div>
+    </div>
+  );
+
   const dashboard = (
     <div className="app dashboard">
       <span className="build-version">v{APP_VERSION}</span>
@@ -788,20 +858,44 @@ const App: React.FC = () => {
               <span className="pair-card-id">{pair.id}</span>
               <span className="pair-card-last muted">{formatLastConnected(pair.lastConnectedAt)}</span>
             </div>
-            <span className="pair-card-arrow" aria-hidden="true">
-              ▶
-            </span>
-            <button
-              type="button"
-              className="btn ghost remove"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleRemovePair(pair.id);
-              }}
-              title="Quitar equipo"
-            >
-              ✕
-            </button>
+            <div className="pair-card-actions">
+              <button
+                type="button"
+                className="pair-action play"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleConnectPair(pair);
+                }}
+                title="Conectar y controlar"
+              >
+                ▶
+              </button>
+              <button
+                type="button"
+                className="pair-action audio"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleConnectAudio(pair);
+                }}
+                title="Solo audio: usar este equipo como bocina"
+              >
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+                  <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z" />
+                  <path d="M14 4.04v2.06a7 7 0 0 1 0 11.8v2.06a9 9 0 0 0 0-15.92z" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="btn ghost remove"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleRemovePair(pair.id);
+                }}
+                title="Quitar equipo"
+              >
+                ✕
+              </button>
+            </div>
           </div>
         ))}
       </div>
@@ -868,7 +962,7 @@ const App: React.FC = () => {
           {STATUS_TOOLTIP[status]}
           {detail && ` — ${detail}`}
         </span>
-        {status === 'connected' && (
+        {status === 'connected' && !audioOnlySession && (
           <button
             type="button"
             className="btn"
@@ -888,114 +982,108 @@ const App: React.FC = () => {
       </header>
 
 
-      <div
-        ref={containerRef}
-        className={`video-container ${remoteActive ? 'remote-active' : ''}`}
-        onMouseEnter={() => setHovering(true)}
-        onMouseLeave={() => {
-          setHovering(false);
-          setRemoteCursor(null);
-          releaseAllMouseButtons();
-        }}
-      >
-        {remoteStream ? (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            className="remote-video"
-            tabIndex={-1}
-            onPointerMove={handleMouseMove}
-            onPointerDown={handleMouseDown}
-            onPointerUp={handleMouseUp}
-            onPointerCancel={handlePointerCancel}
-            onWheel={handleWheel}
-            onContextMenu={handleContextMenu}
-            onLoadedMetadata={(e) => {
-              const v = e.currentTarget;
-              const track = (v.srcObject as MediaStream | null)?.getVideoTracks()[0];
-              console.log(
-                `[client] video_ready w=${v.videoWidth} h=${v.videoHeight} srcW=${track?.getSettings().width ?? '?'}`,
-              );
-            }}
-          />
-        ) : (
-          <div className="no-video">
-            {status === 'connected'
-              ? 'Sin señal de video'
-              : 'El video de la máquina remota aparecerá aquí'}
+      {audioOnlySession ? (
+        <div className="audio-container">
+          <audio ref={audioRef} autoPlay playsInline />
+          <div className="audio-panel">
+            <span className="audio-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="56" height="56" fill="currentColor">
+                <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12z" />
+                <path d="M14 4.04v2.06a7 7 0 0 1 0 11.8v2.06a9 9 0 0 0 0-15.92z" />
+              </svg>
+            </span>
+            <p className="audio-title">Solo audio</p>
+            <p className="muted audio-detail">{sessionName}</p>
+            <p className="audio-status">
+              {status === 'connected'
+                ? remoteHasAudio
+                  ? 'El sonido de este equipo se está reproduciendo aquí.'
+                  : 'Conectado, pero el host no envió audio (loopback solo en Windows).'
+                : STATUS_TOOLTIP[status]}
+            </p>
+            {lostOverlay}
           </div>
-        )}
-
-        {cursorBox && (
-          <div
-            className="remote-cursor"
-            style={{ left: cursorBox.left, top: cursorBox.top }}
-            aria-hidden="true"
-          >
-            <svg viewBox="0 0 24 24" width="24" height="24">
-              <path
-                d="M3 1l7.5 18 3-7 7-3L3 1z"
-                fill="#fff"
-                stroke="#111"
-                strokeWidth="1.5"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </div>
-        )}
-
-        {remoteStream && (
-          <button
-            type="button"
-            className="fs-toggle"
-            onClick={toggleFullscreen}
-            title={fullscreen ? 'Salir de pantalla completa (F11)' : 'Pantalla completa (F11)'}
-          >
-            {fullscreen ? '⤢ Salir' : '⤢ Pantalla completa'}
-          </button>
-        )}
-
-        {lostConnection && (
-          <div className="lost-overlay">
-            <p>Se perdió la conexión con la máquina remota.</p>
-            <div className="lost-actions">
-              <button
-                type="button"
-                className="btn primary"
-                onClick={() => {
-                  autoRetryRef.current = 0;
-                  if (autoRetryTimerRef.current !== null) {
-                    window.clearTimeout(autoRetryTimerRef.current);
-                    autoRetryTimerRef.current = null;
-                  }
-                  const pair = activePairIdRef.current
-                    ? pairs.find((x) => x.id === activePairIdRef.current)
-                    : undefined;
-                  if (pair) {
-                    handleConnectPair(pair);
-                  } else {
-                    connect();
-                  }
-                }}
-              >
-                Reconectar
-              </button>
-              <button type="button" className="btn" onClick={disconnect}>
-                Volver al inicio
-              </button>
+        </div>
+      ) : (
+        <div
+          ref={containerRef}
+          className={`video-container ${remoteActive ? 'remote-active' : ''}`}
+          onMouseEnter={() => setHovering(true)}
+          onMouseLeave={() => {
+            setHovering(false);
+            setRemoteCursor(null);
+            releaseAllMouseButtons();
+          }}
+        >
+          {remoteStream ? (
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              className="remote-video"
+              tabIndex={-1}
+              onPointerMove={handleMouseMove}
+              onPointerDown={handleMouseDown}
+              onPointerUp={handleMouseUp}
+              onPointerCancel={handlePointerCancel}
+              onWheel={handleWheel}
+              onContextMenu={handleContextMenu}
+              onLoadedMetadata={(e) => {
+                const v = e.currentTarget;
+                const track = (v.srcObject as MediaStream | null)?.getVideoTracks()[0];
+                console.log(
+                  `[client] video_ready w=${v.videoWidth} h=${v.videoHeight} srcW=${track?.getSettings().width ?? '?'}`,
+                );
+              }}
+            />
+          ) : (
+            <div className="no-video">
+              {status === 'connected'
+                ? 'Sin señal de video'
+                : 'El video de la máquina remota aparecerá aquí'}
             </div>
-          </div>
-        )}
+          )}
 
-        {stats && status === 'connected' && (
-          <p className="muted quality">
-            Calidad: RTT {stats.rtt !== undefined ? `${stats.rtt.toFixed(0)} ms` : '—'} ·{' '}
-            {stats.mbps !== undefined ? `${stats.mbps.toFixed(1)} Mbps` : '—'} ·{' '}
-            {stats.frames ?? 0} fps
-          </p>
-        )}
-      </div>
+          {cursorBox && (
+            <div
+              className="remote-cursor"
+              style={{ left: cursorBox.left, top: cursorBox.top }}
+              aria-hidden="true"
+            >
+              <svg viewBox="0 0 24 24" width="24" height="24">
+                <path
+                  d="M3 1l7.5 18 3-7 7-3L3 1z"
+                  fill="#fff"
+                  stroke="#111"
+                  strokeWidth="1.5"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </div>
+          )}
+
+          {remoteStream && (
+            <button
+              type="button"
+              className="fs-toggle"
+              onClick={toggleFullscreen}
+              title={fullscreen ? 'Salir de pantalla completa (F11)' : 'Pantalla completa (F11)'}
+            >
+              {fullscreen ? '⤢ Salir' : '⤢ Pantalla completa'}
+            </button>
+          )}
+
+          {lostOverlay}
+
+          {stats && status === 'connected' && (
+            <p className="muted quality">
+              Calidad: RTT {stats.rtt !== undefined ? `${stats.rtt.toFixed(0)} ms` : '—'} ·{' '}
+              {stats.mbps !== undefined ? `${stats.mbps.toFixed(1)} Mbps` : '—'} ·{' '}
+              {stats.frames ?? 0} fps
+            </p>
+          )}
+        </div>
+      )}
 
       <FirestoreStatus />
     </div>

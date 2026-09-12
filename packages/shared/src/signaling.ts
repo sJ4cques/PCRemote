@@ -87,6 +87,11 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 
 const CHANNEL_NAME = "control";
 
+/** true si la oferta SDP no incluye ninguna sección `m=video` (sesión solo bocina). */
+function isAudioOnlyOffer(sdp: string): boolean {
+  return !sdp.split(/\r?\n/).some((line) => line.startsWith("m=video"));
+}
+
 // ---------------------------------------------------------------------------
 // Estado del emparejamiento (expuesto a la UI)
 // ---------------------------------------------------------------------------
@@ -140,6 +145,14 @@ export interface HostPeerOptions extends PeerHandlers {
    * Si devuelve `null`/lanza, la sesión sigue sin video.
    */
   getScreenStream?: () => Promise<MediaStream | null>;
+  /**
+   * Devuelve SOLO audio de escritorio (loopback) para sesiones "solo bocina".
+   * Se usa únicamente cuando el cliente ofrece sin sección `m=video`; en ese
+   * caso no se captura pantalla (evita la degradación de input de Windows al
+   * abrir la segunda captura junto al video). Si devuelve `null`/lanza, la
+   * sesión sigue sin audio.
+   */
+  getAudioStream?: () => Promise<MediaStream | null>;
 }
 
 export class HostPeer {
@@ -154,10 +167,12 @@ export class HostPeer {
   private readonly onData?: (msg: DataChannelMessage) => void;
   private readonly onChannelState?: (open: boolean) => void;
   private readonly getScreenStream?: () => Promise<MediaStream | null>;
+  private readonly getAudioStream?: () => Promise<MediaStream | null>;
 
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private screenStream: MediaStream | null = null;
+  private audioStream: MediaStream | null = null;
   private sessionRef: DocumentReference<DocumentData>;
   private unsubDoc: Unsubscribe | null = null;
   private unsubCandidates: Unsubscribe | null = null;
@@ -182,6 +197,7 @@ export class HostPeer {
     this.onData = options.onData;
     this.onChannelState = options.onChannelState;
     this.getScreenStream = options.getScreenStream;
+    this.getAudioStream = options.getAudioStream;
     this.sessionRef = doc(collection(this.db, FIRESTORE_COLLECTION), this.code);
   }
 
@@ -310,6 +326,8 @@ export class HostPeer {
     }
     this.screenStream?.getTracks().forEach((t) => t.stop());
     this.screenStream = null;
+    this.audioStream?.getTracks().forEach((t) => t.stop());
+    this.audioStream = null;
     this.dc = null;
     this.pc = null;
 
@@ -441,39 +459,66 @@ export class HostPeer {
       return;
     }
     try {
-      await this.pc.setRemoteDescription(
-        new RTCSessionDescription(JSON.parse(offerJson) as RTCSessionDescriptionInit),
-      );
+      const offer = JSON.parse(offerJson) as RTCSessionDescriptionInit;
+      await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
       // Candidatos que llegaron antes del offer: aplicarlos ya.
       this.flushPendingCandidates();
 
-      if (!this.screenStream && this.getScreenStream) {
-        // En un arranque manual Windows puede tardar un momento en publicar la
-        // fuente de escritorio. No contestamos una oferta sin video, porque el
-        // cliente quedaría "conectado" pero mostrando una pantalla vacía.
-        for (let attempt = 1; attempt <= 3 && !this.screenStream; attempt += 1) {
+      // Sesión "solo bocina": el cliente ofrece sin sección `m=video`. Se captura
+      // únicamente audio (loopback) para no degradar el renderer ni el pipeline
+      // de input (en Windows la segunda captura junto al video era la que
+      // rompía --isis-desktop-audio).
+      const audioOnly = offer.sdp ? isAudioOnlyOffer(offer.sdp) : false;
+      if (audioOnly) {
+        if (this.getAudioStream) {
           try {
-            this.screenStream = await this.getScreenStream();
+            this.audioStream = await this.getAudioStream();
           } catch (err) {
-            console.warn(`[HostPeer/${this.code}] getScreenStream attempt=${attempt} error:`, err);
-            this.screenStream = null;
-          }
-          if (!this.screenStream && attempt < 3) {
-            await new Promise((resolve) => setTimeout(resolve, 400));
+            console.warn(`[HostPeer/${this.code}] getAudioStream error:`, err);
+            this.audioStream = null;
           }
         }
-      }
-      if (this.getScreenStream && !this.screenStream) {
-        throw new Error('screen_stream_unavailable');
-      }
-      if (this.screenStream) {
-        const existing = new Set(this.pc.getSenders().map((s) => s.track));
-        for (const track of this.screenStream.getTracks()) {
-          if (track.kind !== "video" && track.kind !== "audio") {
-            continue;
+        if (this.audioStream) {
+          const existing = new Set(this.pc.getSenders().map((s) => s.track));
+          for (const track of this.audioStream.getTracks()) {
+            if (track.kind !== "audio" || existing.has(track)) {
+              continue;
+            }
+            this.pc.addTrack(track, this.audioStream);
           }
-          if (!existing.has(track)) {
-            this.pc.addTrack(track, this.screenStream);
+        }
+        console.log(
+          `[HostPeer/${this.code}] answer audio_only audioTracks=${this.audioStream ? this.audioStream.getAudioTracks().length : 0}`,
+        );
+      } else {
+        if (!this.screenStream && this.getScreenStream) {
+          // En un arranque manual Windows puede tardar un momento en publicar la
+          // fuente de escritorio. No contestamos una oferta sin video, porque el
+          // cliente quedaría "conectado" pero mostrando una pantalla vacía.
+          for (let attempt = 1; attempt <= 3 && !this.screenStream; attempt += 1) {
+            try {
+              this.screenStream = await this.getScreenStream();
+            } catch (err) {
+              console.warn(`[HostPeer/${this.code}] getScreenStream attempt=${attempt} error:`, err);
+              this.screenStream = null;
+            }
+            if (!this.screenStream && attempt < 3) {
+              await new Promise((resolve) => setTimeout(resolve, 400));
+            }
+          }
+        }
+        if (this.getScreenStream && !this.screenStream) {
+          throw new Error('screen_stream_unavailable');
+        }
+        if (this.screenStream) {
+          const existing = new Set(this.pc.getSenders().map((s) => s.track));
+          for (const track of this.screenStream.getTracks()) {
+            if (track.kind !== "video" && track.kind !== "audio") {
+              continue;
+            }
+            if (!existing.has(track)) {
+              this.pc.addTrack(track, this.screenStream);
+            }
           }
         }
       }
@@ -587,6 +632,11 @@ export interface ClientPeerOptions extends PeerHandlers {
   /** Tiempo máximo de negociación antes de abortar (ms). */
   connectionTimeoutMs?: number;
   iceServers?: RTCIceServer[];
+  /**
+   * Modo "solo bocina": no se negocia video, solo se recibe audio del host
+   * (el oferente no crea la sección `m=video` y el host responde con solo audio).
+   */
+  audioOnly?: boolean;
   /** Se invoca al recibir el primer track remoto con el stream de video. */
   onRemoteStream?: (stream: MediaStream) => void;
 }
@@ -604,6 +654,7 @@ export class ClientPeer {
   private readonly secret?: string;
   private readonly connectionTimeoutMs: number;
   private readonly iceServers: RTCIceServer[];
+  private readonly audioOnly: boolean;
   private readonly onStatus: (status: PeerStatus, detail?: string) => void;
   private readonly onData?: (msg: DataChannelMessage) => void;
   private readonly onChannelState?: (open: boolean) => void;
@@ -633,6 +684,7 @@ export class ClientPeer {
     this.secret = options.secret;
     this.connectionTimeoutMs = options.connectionTimeoutMs ?? 90 * 1000;
     this.iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS;
+    this.audioOnly = options.audioOnly === true;
     this.onStatus = options.onStatus;
     this.onData = options.onData;
     this.onChannelState = options.onChannelState;
@@ -683,8 +735,12 @@ export class ClientPeer {
     this.pc.onconnectionstatechange = () => this.handleConnectionState();
     this.pc.ondatachannel = (ev) => this.attachChannel(ev.channel);
     // Esperamos video y audio (sendonly) del host en la respuesta. Se negocian
-    // en el mismo offer/answer gracias a estos transceivers recvonly.
-    this.pc.addTransceiver("video", { direction: "recvonly" });
+    // en el mismo offer/answer gracias a estos transceivers recvonly. En modo
+    // "solo bocina" no se pide video: el SDP resultante no lleva sección
+    // `m=video` y el host responde capturando únicamente audio (loopback).
+    if (!this.audioOnly) {
+      this.pc.addTransceiver("video", { direction: "recvonly" });
+    }
     this.pc.addTransceiver("audio", { direction: "recvonly" });
     this.pc.ontrack = (ev) => {
       if (ev.streams.length > 0 && ev.streams[0]) {

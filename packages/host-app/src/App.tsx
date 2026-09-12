@@ -231,6 +231,44 @@ const App: React.FC = () => {
   }, [addDesktopAudio, stopScreen]);
 
   /**
+   * Captura SOLO audio de escritorio (loopback) para sesiones "solo bocina"
+   * (el cliente ofrece sin m=video). Solo Windows; main resuelve el
+   * getDisplayMedia({audio:true, video:false}) a `{ audio: 'loopback' }`.
+   * Como no hay video capturado, no sufre la degradación del renderer/input
+   * por la que está gateado `desktopAudio` (esa segunda captura rompía solo
+   * por estar JUNTO al video).
+   */
+  const getAudioStream = useCallback(async (): Promise<MediaStream | null> => {
+    await stopScreen();
+    const platform = window.isis?.platform ?? 'darwin';
+    if (platform !== 'win32') {
+      console.log('[host] getAudioStream: loopback solo disponible en Windows');
+      return null;
+    }
+    try {
+      const stream = (await navigator.mediaDevices.getDisplayMedia({
+        audio: true,
+        video: false,
+      } as MediaStreamConstraints)) as MediaStream;
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        stream.getTracks().forEach((t) => t.stop());
+        console.warn('[host] getAudioStream: captura sin pistas de audio');
+        return null;
+      }
+      setAudioMode('loopback');
+      setScreenMode('off');
+      setCaptureError('');
+      streamRef.current = stream;
+      console.log(`[host] stream_mode=audio_only tracks=${audioTracks.length}`);
+      return stream;
+    } catch (err) {
+      console.warn('[host] getAudioStream fallida:', err);
+      return null;
+    }
+  }, [stopScreen]);
+
+  /**
    * Captura la pantalla real (Windows/macOS/Linux).
    *
    * Preferimos getDisplayMedia porque Electron puede resolverlo desde main sin
@@ -407,6 +445,7 @@ const App: React.FC = () => {
           pin: p || undefined,
           waitTimeoutMs: ttlMs,
           getScreenStream,
+          getAudioStream,
           onStatus: (s, d) => statusMessage(s, d),
           onData: (m) => handleData(m, peer),
           onChannelState,
@@ -416,7 +455,7 @@ const App: React.FC = () => {
         console.log(`[host] manual_session_ready code=${newCode}`);
       })();
     },
-    [getScreenStream, statusMessage, handleData, onChannelState],
+    [getScreenStream, getAudioStream, statusMessage, handleData, onChannelState],
   );
 
   useEffect(() => {
@@ -457,6 +496,7 @@ const App: React.FC = () => {
         secret,
         deviceName: deviceNameRef.current,
         getScreenStream,
+        getAudioStream,
         onStatus: (s, d) => {
           statusMessage(s, d);
           if ((s === 'ended' || s === 'error') && !cancelled) {
@@ -487,7 +527,7 @@ const App: React.FC = () => {
       peerRef.current = null;
       stopScreen();
     };
-  }, [mode, restartKey, pairedAvailable, getScreenStream, statusMessage, handleData, onChannelState, stopScreen]);
+  }, [mode, restartKey, pairedAvailable, getScreenStream, getAudioStream, statusMessage, handleData, onChannelState, stopScreen]);
 
   // --- Diagnóstico: `--isis-capture-test` captura al arrancar y loguea ------
 

@@ -103,6 +103,7 @@ const isisCode = argValue('--isis-code');
 const isisPin = argValue('--isis-pin');
 const isisInputTest = process.argv.includes('--isis-input-test');
 const isisClipboardTest = process.argv.includes('--isis-clipboard-test');
+const isisAudioOnly = process.argv.includes('--isis-audio-only');
 const isisAutostop = argValue('--isis-autostop');
 // Pruebas: --isis-pair=<hostId>,<secret> conecta directo a un host emparejado.
 const isisPairArgs = argValue('--isis-pair');
@@ -122,6 +123,7 @@ const createWindow = (): void => {
         ...(isisPin ? [`--isis-pin=${isisPin}`] : []),
         ...(isisInputTest ? ['--isis-input-test'] : []),
         ...(isisClipboardTest ? ['--isis-clipboard-test'] : []),
+        ...(isisAudioOnly ? ['--isis-audio-only'] : []),
         ...(isisAutostop ? [`--isis-autostop=${isisAutostop}`] : []),
         ...(isisPairArgs ? [`--isis-pair=${isisPairArgs}`] : []),
       ],

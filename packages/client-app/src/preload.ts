@@ -2,7 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 // Args opcionales inyectados desde el proceso main (probar/automatizar la app):
 //   --isis-code=<codigo>  --isis-pin=<pin>  --isis-input-test  --isis-clipboard-test
-//   --isis-autostop=<seg>  --isis-pair=<hostId>,<secret>
+//   --isis-autostop=<seg>  --isis-pair=<hostId>,<secret>  --isis-audio-only
 const isisArgs: {
   code?: string;
   pin?: string;
@@ -10,6 +10,7 @@ const isisArgs: {
   clipboardTest?: boolean;
   autostop?: number;
   pair?: { id: string; secret: string };
+  audioOnly?: boolean;
 } = {};
 
 for (const arg of process.argv) {
@@ -21,6 +22,8 @@ for (const arg of process.argv) {
     isisArgs.inputTest = true;
   } else if (arg === '--isis-clipboard-test') {
     isisArgs.clipboardTest = true;
+  } else if (arg === '--isis-audio-only') {
+    isisArgs.audioOnly = true;
   } else if (arg.startsWith('--isis-autostop=')) {
     const value = Number(arg.slice('--isis-autostop='.length));
     if (Number.isFinite(value) && value > 0) {
