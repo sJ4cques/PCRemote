@@ -137,10 +137,12 @@ const App: React.FC = () => {
    */
   const addDesktopAudio = useCallback(async (stream: MediaStream): Promise<void> => {
     const platform = window.isis?.platform ?? 'darwin';
+    const desktopAudioEnabled =
+      window.isis?.desktopAudio === true || config?.desktopAudio === true;
     if (
       platform !== 'win32' ||
       window.isis?.simulateVideo ||
-      window.isis?.desktopAudio !== true
+      !desktopAudioEnabled
     ) {
       if (platform === 'win32' && !window.isis?.simulateVideo) {
         console.log('[host] stream_audio=off (loopback desactivado; actívalo en el panel)');
@@ -165,7 +167,7 @@ const App: React.FC = () => {
       console.warn('[host] audio loopback fallida; sin audio:', err);
       setAudioMode('off');
     }
-  }, []);
+  }, [config?.desktopAudio]);
 
   const getScreenStream = useCallback(async (): Promise<MediaStream | null> => {
     await stopScreen();
@@ -226,7 +228,7 @@ const App: React.FC = () => {
       setScreenMode('off');
       return null;
     }
-  }, [stopScreen]);
+  }, [addDesktopAudio, stopScreen]);
 
   /**
    * Captura la pantalla real (Windows/macOS/Linux).
