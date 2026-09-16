@@ -84,6 +84,9 @@ importers:
       firebase:
         specifier: ^11.0.0
         version: 11.10.0
+      nice-try:
+        specifier: ^1.0.4
+        version: 1.0.5
       react:
         specifier: ^19.0.0
         version: 19.2.8

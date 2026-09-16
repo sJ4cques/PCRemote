@@ -78,7 +78,12 @@ function dependencyClosure(entries: string[]): string[] {
  * Este hook copia la clausura completa dentro del app empaquetada (pre-asar).
  */
 async function copyNutClosure(buildPath: string): Promise<void> {
-  const closure = dependencyClosure(['@nut-tree-fork/nut-js']);
+  // nice-try es dependencia transitiva de nut-js (clipboardy -> execa ->
+  // cross-spawn v6). Su hoisting depende de la versión de cross-spawn que
+  // pnpm resuelva (v7 ya no la declara), por eso la semillamos explícitamente
+  // como dependencia directa de la clausura: el worker la requiere desde
+  // app.asar y su ausencia provoca MODULE_NOT_FOUND (code=1) al cargar nut-js.
+  const closure = dependencyClosure(['@nut-tree-fork/nut-js', 'nice-try']);
   console.log(`[forge] packageAfterCopy: copiando clausura nut-js (${closure.length} pkgs) a ${buildPath}`);
   for (const name of closure) {
     const src = path.join(ROOT_NODE_MODULES, name);
