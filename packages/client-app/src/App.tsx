@@ -583,6 +583,10 @@ const App: React.FC = () => {
       setView('session');
       audioOnlyRef.current = Boolean(audioOnly ?? audioOnlyRef.current);
       setAudioOnlySession(audioOnlyRef.current);
+      if (audioOnlyRef.current) {
+        // Modo bocina: evita el sueño con la tapa cerrada y apaga la pantalla al cerrarla.
+        window.isis?.setLidMode(true);
+      }
       manualDisconnectRef.current = false;
       lastPeerParamsRef.current = { c, p, s: secretArg, audioOnly: audioOnlyRef.current };
       void (async () => {
@@ -687,6 +691,10 @@ const App: React.FC = () => {
     manualDisconnectRef.current = true;
     autoRetryRef.current = 0;
     releaseAllMouseButtons();
+    if (audioOnlyRef.current) {
+      // Salir del modo bocina: restaura la configuración de energía normal.
+      window.isis?.setLidMode(false);
+    }
     void (async () => {
       await peerRef.current?.stop();
       peerRef.current = null;
@@ -745,6 +753,9 @@ const App: React.FC = () => {
       if (autoRetryTimerRef.current !== null) {
         window.clearTimeout(autoRetryTimerRef.current);
         autoRetryTimerRef.current = null;
+      }
+      if (audioOnlyRef.current) {
+        window.isis?.setLidMode(false);
       }
       void peerRef.current?.stop();
     };

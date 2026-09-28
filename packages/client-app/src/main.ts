@@ -1,9 +1,140 @@
 import { app, BrowserWindow, clipboard, ipcMain } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
 
 // Permitir reproducir srcObject sin gesto del usuario (audífonos del control remoto).
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
+// ---------------------------------------------------------------------------
+// Modo bocina con tapa cerrada (solo macOS).
+//   - Al entrar en modo "solo audio" se desactiva el sueño del sistema
+//     (pmset disablesleep 1) para que el audio siga con la tapa cerrada.
+//   - Un watcher sondea la tapa (ioreg AppleClamshellState) y, al cerrarse,
+//     apaga la pantalla (pmset displaysleepnow) sin bloquearla.
+//   - Al salir del modo bocina se restaura el valor previo de disablesleep.
+// Requiere que /usr/bin/pmset tenga permiso sudoers NOPASSWD.
+// ---------------------------------------------------------------------------
+
+const PMSET = '/usr/bin/pmset';
+const IOREG = '/usr/bin/ioreg';
+
+let lidModeActive = false;
+/** Valor de SleepDisabled antes de entrar en modo bocina (para restaurarlo). */
+let lidPrevSleepDisabled: string | null = null;
+let lidPollTimer: NodeJS.Timeout | null = null;
+let lidWasClosed = false;
+
+function runPmset(args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('/usr/bin/sudo', ['-n', PMSET, ...args], (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(stderr.trim() || err.message));
+      } else {
+        resolve(stdout);
+      }
+    });
+  });
+}
+
+async function readSleepDisabled(): Promise<string | null> {
+  try {
+    const out = await runPmset(['-g']);
+    const match = out.match(/SleepDisabled\s+(\d+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function readLidClosed(): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(IOREG, ['-r', '-k', 'AppleClamshellState', '-d', '4'], (err, stdout) => {
+      if (err) {
+        resolve(false);
+        return;
+      }
+      const match = stdout.match(/AppleClamshellState"\s*=\s*(Yes|No)/);
+      resolve(match ? match[1] === 'Yes' : false);
+    });
+  });
+}
+
+async function enableLidMode(): Promise<void> {
+  if (lidModeActive) {
+    return;
+  }
+  lidModeActive = true;
+  lidPrevSleepDisabled = await readSleepDisabled();
+  try {
+    await runPmset(['-a', 'disablesleep', '1']);
+    console.log('[client] modo bocina: disablesleep=1 (funciona con la tapa cerrada)');
+  } catch (err) {
+    console.error('[client] modo bocina: no se pudo desactivar el sueño:', err);
+  }
+  lidWasClosed = await readLidClosed();
+  if (lidWasClosed) {
+    void runPmset(['displaysleepnow']).catch((err) =>
+      console.error('[client] modo bocina: no se pudo apagar la pantalla:', err),
+    );
+  }
+  lidPollTimer = setInterval(() => {
+    void readLidClosed().then((closed) => {
+      if (closed && !lidWasClosed) {
+        void runPmset(['displaysleepnow'])
+          .then(() => console.log('[client] modo bocina: tapa cerrada, pantalla apagada'))
+          .catch((err) => console.error('[client] modo bocina: no se pudo apagar la pantalla:', err));
+      }
+      lidWasClosed = closed;
+    });
+  }, 1000);
+}
+
+async function disableLidMode(): Promise<void> {
+  if (!lidModeActive) {
+    return;
+  }
+  lidModeActive = false;
+  if (lidPollTimer) {
+    clearInterval(lidPollTimer);
+    lidPollTimer = null;
+  }
+  const restore = lidPrevSleepDisabled ?? '0';
+  lidPrevSleepDisabled = null;
+  try {
+    await runPmset(['-a', 'disablesleep', restore]);
+    console.log(`[client] modo bocina: disablesleep restaurado a ${restore}`);
+  } catch (err) {
+    console.error('[client] modo bocina: no se pudo restaurar el sueño:', err);
+  }
+}
+
+/** Restauración síncrona para el cierre de la app (no se puede esperar async). */
+function disableLidModeSync(): void {
+  if (!lidModeActive) {
+    return;
+  }
+  lidModeActive = false;
+  if (lidPollTimer) {
+    clearInterval(lidPollTimer);
+    lidPollTimer = null;
+  }
+  const restore = lidPrevSleepDisabled ?? '0';
+  try {
+    execFileSync('/usr/bin/sudo', ['-n', PMSET, '-a', 'disablesleep', restore]);
+    console.log(`[client] modo bocina: disablesleep restaurado a ${restore} (cierre)`);
+  } catch (err) {
+    console.error('[client] modo bocina: no se pudo restaurar el sueño al cerrar:', err);
+  }
+}
+
+ipcMain.on('isis:lid-mode', (_event, enabled: unknown) => {
+  if (Boolean(enabled)) {
+    void enableLidMode();
+  } else {
+    void disableLidMode();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Pares guardados (userData/isis-pairs.json). Estructura idéntica a PairRecord
@@ -142,9 +273,14 @@ const createWindow = (): void => {
 app.on('ready', createWindow);
 
 app.on('window-all-closed', () => {
+  disableLidModeSync();
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', () => {
+  disableLidModeSync();
 });
 
 app.on('activate', () => {

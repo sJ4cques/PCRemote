@@ -50,6 +50,10 @@ contextBridge.exposeInMainWorld('isis', {
   setFullscreen: (full: boolean): void => {
     ipcRenderer.send('isis:set-fullscreen', full);
   },
+  /** Activa/desactiva el modo tapa cerrada (solo macOS, sesión "solo bocina"). */
+  setLidMode: (enabled: boolean): void => {
+    ipcRenderer.send('isis:lid-mode', enabled);
+  },
   /** Devuelve la lista de equipos emparejados guardados. */
   getPairs: (): Promise<SavedPair[]> => ipcRenderer.invoke('isis:pairs-get') as Promise<SavedPair[]>,
   /** Guarda/actualiza un equipo emparejado. Devuelve la lista. */

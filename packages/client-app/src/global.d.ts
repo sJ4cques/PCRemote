@@ -30,6 +30,8 @@ declare global {
       writeClipboard: (text: string) => Promise<void>;
       /** Alterna la pantalla completa de la ventana. */
       setFullscreen: (full: boolean) => void;
+      /** Activa/desactiva el modo tapa cerrada (solo macOS, sesión "solo bocina"). */
+      setLidMode: (enabled: boolean) => void;
       /** Devuelve la lista de equipos emparejados guardados. */
       getPairs: () => Promise<SavedPair[]>;
       /** Guarda/actualiza un equipo emparejado. Devuelve la lista. */
