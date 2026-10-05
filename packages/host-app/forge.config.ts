@@ -118,7 +118,10 @@ const config: ForgeConfig = {
     },
   },
   makers: [
-    new MakerSquirrel({}),
+    // Squirrel solo se puede ejecutar desde Windows (en otros sistemas necesita
+    // Wine), así que al compilar desde macOS generamos únicamente la portable.
+    ...(process.platform === 'win32' ? [new MakerSquirrel({})] : []),
+    new MakerZIP(),
   ],
   plugins: [
     new AutoUnpackNativesPlugin({}),

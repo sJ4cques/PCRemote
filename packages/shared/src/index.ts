@@ -15,6 +15,7 @@ export {
   sha256Hex,
   HostPeer,
   ClientPeer,
+  HOST_OFFLINE_REASONS,
   type PeerStatus,
   type PeerHandlers,
   type HostPeerOptions,

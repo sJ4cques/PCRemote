@@ -136,6 +136,13 @@ body {
   color: #f2555a;
 }
 
+/* Host apagado / inalcanzable: mismo rojo que error pero con su rótulo. */
+.pill.offline {
+  background: #2b1416;
+  color: #ff6b6b;
+  font-weight: 600;
+}
+
 .pill.warn {
   background: #271803;
   color: #ffb347;
@@ -231,6 +238,62 @@ body {
   color: #e8e8ea;
   font-size: 0.95rem;
   padding: 1rem;
+  text-align: center;
+}
+
+/* Fallback "PC Offline": el cuadro queda opaco del todo porque ya no hay
+   nada que mirar (el último frame congelado no informa de nada). */
+.lost-overlay.offline {
+  background: rgba(14, 16, 20, 0.94);
+}
+
+.offline-badge {
+  display: grid;
+  place-items: center;
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  border: 1px solid #3a2a2e;
+  background: #22161a;
+  color: #ff6b6b;
+  animation: offline-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes offline-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.65;
+    transform: scale(0.96);
+  }
+}
+
+.lost-title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.lost-overlay.offline .lost-title {
+  color: #ff6b6b;
+}
+
+.lost-hint {
+  margin: 0;
+  max-width: 34rem;
+  color: #b6bac2;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.lost-retry {
+  margin: 0;
+  color: #e8a23c;
+  font-size: 0.82rem;
 }
 
 .quality {

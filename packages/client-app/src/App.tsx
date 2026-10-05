@@ -5,6 +5,7 @@ import {
   FirestoreStatus,
   getFirebaseDb,
   normalizeKey,
+  HOST_OFFLINE_REASONS,
   type DataChannelMessage,
   type MouseAction,
   type MouseButton,
@@ -36,7 +37,15 @@ const ERROR_DETAIL: Record<string, string> = {
   pair_token_invalid: 'El secreto de este equipo ya no es válido. Volvé a emparejar.',
   pair_token_missing: 'El host no pudo validar tu emparejamiento.',
   rejected: 'Conexión rechazada por la máquina remota.',
+  host_offline: 'La máquina remota dejó de responder.',
+  keepalive_timeout: 'La máquina remota dejó de responder.',
 };
+
+/** Motivos propios del cliente que también significan "no hay PC al otro lado". */
+const OFFLINE_REASONS = new Set([...HOST_OFFLINE_REASONS, 'no_answer']);
+
+/** Cuánto esperamos al host antes de asumir que su PC está apagada (ms). */
+const HOST_SILENCE_MS = 15_000;
 
 interface StreamStats {
   rtt?: number;
@@ -66,6 +75,13 @@ const App: React.FC = () => {
   const [hovering, setHovering] = useState(false);
   const [audioOnlySession, setAudioOnlySession] = useState(false);
   const [remoteCursor, setRemoteCursor] = useState<{ x: number; y: number } | null>(null);
+  /** La PC remota no está: se apagó, cerró el host o no responde. Muestra el
+   *  fallback "PC Offline" sobre el video (congelado o vacío). */
+  const [hostOffline, setHostOffline] = useState(false);
+  const [offlineReason, setOfflineReason] = useState('');
+  /** Aviso de reintento automático mientras se espera que vuelva el host. */
+  const [retryInfo, setRetryInfo] = useState('');
+  const [online, setOnline] = useState(() => navigator.onLine !== false);
   const peerRef = useRef<ClientPeer | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -103,6 +119,19 @@ const App: React.FC = () => {
   const autoRetryTimerRef = useRef<number | null>(null);
   /** El usuario pulsó Desconectar: no reconectar en automático. */
   const manualDisconnectRef = useRef(false);
+  /** Espejo del `status` para poder consultarlo desde timers sin recrearlos. */
+  const statusRef = useRef<PeerStatus>('idle');
+  /** Espejo del motivo de "PC Offline" (los callbacks del peer se crean una
+   *  sola vez y no pueden leer el estado sin provocar closures obsoletos). */
+  const offlineReasonRef = useRef('');
+  /** Número de intento de conexión. Los callbacks de un peer viejo (al detenerlo
+   *  emite su `ended` final) se ignoran si no son del último intento: si no,
+   *  su `ended` pisaría el estado y cancelaría el watchdog del nuevo. */
+  const generationRef = useRef(0);
+  /** Alarma de "el host no responde": dispara el fallback PC Offline si la
+   *  negociación se eterniza (típico: el host está apagado pero su sesión
+   *  emparejada sigue publicada en Firestore, así que no da error). */
+  const silenceTimerRef = useRef<number | null>(null);
   /** Sesión "solo bocina": se recibe solo audio, sin control remoto. */
   const audioOnlyRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -572,8 +601,28 @@ const App: React.FC = () => {
     }
   }, [remoteStream]);
 
+  /** Marca el fallback "PC Offline" y guarda el motivo para los reintentos. */
+  const markOffline = useCallback((reason: string) => {
+    offlineReasonRef.current = reason;
+    setOfflineReason(reason);
+    setHostOffline(true);
+  }, []);
+
+  const clearOffline = useCallback(() => {
+    offlineReasonRef.current = '';
+    setOfflineReason('');
+    setHostOffline(false);
+  }, []);
+
   const connect = useCallback(
-    (codeArg?: string, pinArg?: string, secretArg?: string, pairName?: string, audioOnly?: boolean) => {
+    (
+      codeArg?: string,
+      pinArg?: string,
+      secretArg?: string,
+      pairName?: string,
+      audioOnly?: boolean,
+      isAutoRetry = false,
+    ) => {
       const c = (secretArg ? normalizeKey(codeArg ?? '') : (codeArg ?? code).trim().toLowerCase()).trim();
       const p = pinArg ?? pin;
       if (!c) {
@@ -589,6 +638,37 @@ const App: React.FC = () => {
       }
       manualDisconnectRef.current = false;
       lastPeerParamsRef.current = { c, p, s: secretArg, audioOnly: audioOnlyRef.current };
+      const generation = generationRef.current + 1;
+      generationRef.current = generation;
+      /** Callback de un peer que ya no es el vigente: se ignora. */
+      const stale = (): boolean => generationRef.current !== generation;
+      if (!isAutoRetry) {
+        // Un reintento automático no borra el fallback "PC Offline": si la PC
+        // sigue apagada el usuario debe seguir viendo por qué no entra.
+        clearOffline();
+        setRetryInfo('');
+      }
+      statusRef.current = 'idle';
+      if (silenceTimerRef.current !== null) {
+        window.clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+      // Si el host no completa la conexión en HOST_SILENCE_MS no damos nada por
+      // hecho y mostramos el fallback "PC Offline" (con su botón de reintentar)
+      // en vez de quedarnos mirando un cuadro vacío.
+      silenceTimerRef.current = window.setTimeout(() => {
+        silenceTimerRef.current = null;
+        const st = statusRef.current;
+        if (
+          st !== 'connected' &&
+          st !== 'ended' &&
+          st !== 'error' &&
+          !manualDisconnectRef.current
+        ) {
+          console.log(`[client] host sin respuesta tras ${HOST_SILENCE_MS}ms (status=${st}); offline`);
+          markOffline('no_answer');
+        }
+      }, HOST_SILENCE_MS);
       void (async () => {
         if (peerRef.current) {
           await peerRef.current.stop();
@@ -604,11 +684,24 @@ const App: React.FC = () => {
           secret: secretArg,
           audioOnly: Boolean(audioOnly),
           onStatus: (s, d) => {
+            if (stale()) {
+              console.log(`[client] status=${s} ignorado (peer de un intento anterior)`);
+              return;
+            }
             console.log(`[client] status=${s}${d ? ` detail=${d}` : ''}`);
             setStatus(s);
+            statusRef.current = s;
             setDetail(d ? (ERROR_DETAIL[d] ?? d) : '');
             if (s === 'connected') {
               autoRetryRef.current = 0;
+              // Llegó la máquina: el fallback "PC Offline" ya no aplica (aunque
+              // se haya mostrado antes por una negociación lenta).
+              clearOffline();
+              setRetryInfo('');
+              if (silenceTimerRef.current !== null) {
+                window.clearTimeout(silenceTimerRef.current);
+                silenceTimerRef.current = null;
+              }
               console.log(`[client] CONNECTED code=${c}${pairName ? ` team=${pairName}` : ''}`);
               if (activePairIdRef.current) {
                 void window.isis?.getPairs().then((list) => {
@@ -619,6 +712,16 @@ const App: React.FC = () => {
                 });
               }
               return;
+            }
+            if ((s === 'ended' || s === 'error') && d && OFFLINE_REASONS.has(d) && everConnectedRef.current) {
+              // Cayeron el transporte o el keepalive con una sesión ya buena:
+              // para el operador la PC remota está apagada.
+              markOffline(d);
+            }
+            if ((s === 'ended' || s === 'error') && silenceTimerRef.current !== null) {
+              // La negociación terminó (bien o mal): el watchdog ya no aplica.
+              window.clearTimeout(silenceTimerRef.current);
+              silenceTimerRef.current = null;
             }
             // Tras haber tenido una sesión buena, una caída del transporte se
             // intenta en automático (la WebRTC se muere sola a veces: ICE
@@ -634,14 +737,22 @@ const App: React.FC = () => {
               if (params) {
                 autoRetryRef.current += 1;
                 console.log(`[client] auto_reconnect intento ${autoRetryRef.current}/3 en 1.5s`);
+                setRetryInfo(`Reintentando… (${autoRetryRef.current}/3)`);
                 autoRetryTimerRef.current = window.setTimeout(() => {
                   autoRetryTimerRef.current = null;
-                  connect(params.c, params.p, params.s, undefined, params.audioOnly);
+                  connect(params.c, params.p, params.s, undefined, params.audioOnly, true);
                 }, 1500);
               }
             }
+            if ((s === 'ended' || s === 'error') && autoRetryRef.current >= 3) {
+              // Se agotaron los reintentos: el aviso deja de prometer conexión.
+              setRetryInfo('');
+            }
           },
           onData: (msg) => {
+            if (stale()) {
+              return;
+            }
             if (msg.kind === 'hello') {
               console.log(`[client] peer_hello device=${msg.payload.deviceName}`);
               setDetail(`Máquina remota: ${msg.payload.deviceName}`);
@@ -664,6 +775,9 @@ const App: React.FC = () => {
             console.log(`[client] channel_state=${open ? 'open' : 'closed'}`);
           },
           onRemoteStream: (stream) => {
+            if (stale()) {
+              return;
+            }
             const tracks = stream.getVideoTracks();
             const audio = stream.getAudioTracks();
             console.log(
@@ -680,7 +794,7 @@ const App: React.FC = () => {
         console.log(`[client] session_started code=${c}`);
       })();
     },
-    [code, pin],
+    [code, pin, clearOffline, markOffline],
   );
 
   const disconnect = useCallback(() => {
@@ -688,8 +802,14 @@ const App: React.FC = () => {
       window.clearTimeout(autoRetryTimerRef.current);
       autoRetryTimerRef.current = null;
     }
+    if (silenceTimerRef.current !== null) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     manualDisconnectRef.current = true;
     autoRetryRef.current = 0;
+    clearOffline();
+    setRetryInfo('');
     releaseAllMouseButtons();
     if (audioOnlyRef.current) {
       // Salir del modo bocina: restaura la configuración de energía normal.
@@ -702,18 +822,32 @@ const App: React.FC = () => {
       audioOnlyRef.current = false;
       setAudioOnlySession(false);
       setStatus('idle');
+      statusRef.current = 'idle';
       setDetail('');
       setRemoteStream(null);
       setSessionName('');
       setView('dashboard');
     })();
-  }, [releaseAllMouseButtons]);
+  }, [releaseAllMouseButtons, clearOffline]);
 
   useEffect(() => {
     if (status === 'connected') {
       everConnectedRef.current = true;
     }
   }, [status]);
+
+  /** Sin internet local el síntoma es idéntico al de una PC apagada; lo
+   *  distinguimos para que el fallback "PC Offline" no culpe al host. */
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, []);
 
   const lostConnection =
     (status === 'ended' || status === 'error') && everConnectedRef.current;
@@ -753,6 +887,10 @@ const App: React.FC = () => {
       if (autoRetryTimerRef.current !== null) {
         window.clearTimeout(autoRetryTimerRef.current);
         autoRetryTimerRef.current = null;
+      }
+      if (silenceTimerRef.current !== null) {
+        window.clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
       }
       if (audioOnlyRef.current) {
         window.isis?.setLidMode(false);
@@ -797,35 +935,74 @@ const App: React.FC = () => {
     return `Última conexión: ${new Date(ts).toLocaleString()}`;
   };
 
-  /** Overlay de "se perdió la conexión" (compartido por las vistas video y solo-audio). */
-  const lostOverlay = lostConnection && (
-    <div className="lost-overlay">
-      <p>Se perdió la conexión con la máquina remota.</p>
+  /** Reintenta la sesión con los mismos parámetros (respeta el modo bocina). */
+  const handleReconnect = useCallback(() => {
+    autoRetryRef.current = 0;
+    if (autoRetryTimerRef.current !== null) {
+      window.clearTimeout(autoRetryTimerRef.current);
+      autoRetryTimerRef.current = null;
+    }
+    if (silenceTimerRef.current !== null) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    const pair = activePairIdRef.current
+      ? pairs.find((x) => x.id === activePairIdRef.current)
+      : undefined;
+    if (pair) {
+      if (audioOnlyRef.current) {
+        handleConnectAudio(pair);
+      } else {
+        handleConnectPair(pair);
+      }
+    } else {
+      connect();
+    }
+  }, [pairs, connect, handleConnectAudio, handleConnectPair]);
+
+  /** Explicación del fallback según por qué se cayó la sesión. */
+  const offlineHint = (): string => {
+    if (!online) {
+      return 'Este equipo quedó sin conexión a internet. Revisá tu red: el control remoto no puede funcionar hasta que vuelva.';
+    }
+    switch (offlineReason) {
+      case 'no_answer':
+        return `El equipo "${sessionName || 'remoto'}" no respondió. Puede estar apagado, suspendido, con la app cerrada o detrás de una red que bloquea la conexión.`;
+      case 'keepalive_timeout':
+        return `El equipo "${sessionName || 'remoto'}" dejó de responder y la sesión se cortó. Es probable que la PC se haya apagado o dormido.`;
+      case 'connection_failed':
+        return `No se pudo mantener la conexión con "${sessionName || 'remoto'}". La PC puede haberse apagado o haber cambiado de red.`;
+      default:
+        return `"${sessionName || 'La máquina remota'}" se apagó o cerró la app del host. Encendela para volver a controlar su pantalla.`;
+    }
+  };
+
+  /**
+   * Overlay de sesión caída (compartido por las vistas video y solo-audio).
+   * Cubre los dos casos: "PC Offline" (el host no está) y la desconexión
+   * simple, con reconexión manual en ambos.
+   */
+  const lostOverlay = (hostOffline || lostConnection) && (
+    <div className={`lost-overlay ${hostOffline ? 'offline' : ''}`} role="status">
+      {hostOffline && (
+        <span className="offline-badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="2.5" y="4" width="19" height="12.5" rx="1.6" />
+            <path d="M9 20h6" />
+            <path d="M12 8.5v3.5" />
+            <circle cx="12" cy="14.6" r="0.9" fill="currentColor" stroke="none" />
+            <path d="M2.5 2.5 21.5 21.5" strokeWidth="1.8" />
+          </svg>
+        </span>
+      )}
+      <p className="lost-title">
+        {hostOffline ? 'PC Offline' : 'Se perdió la conexión con la máquina remota.'}
+      </p>
+      {hostOffline && <p className="lost-hint">{offlineHint()}</p>}
+      {hostOffline && retryInfo && <p className="lost-retry">{retryInfo}</p>}
       <div className="lost-actions">
-        <button
-          type="button"
-          className="btn primary"
-          onClick={() => {
-            autoRetryRef.current = 0;
-            if (autoRetryTimerRef.current !== null) {
-              window.clearTimeout(autoRetryTimerRef.current);
-              autoRetryTimerRef.current = null;
-            }
-            const pair = activePairIdRef.current
-              ? pairs.find((x) => x.id === activePairIdRef.current)
-              : undefined;
-            if (pair) {
-              if (audioOnlyRef.current) {
-                handleConnectAudio(pair);
-              } else {
-                handleConnectPair(pair);
-              }
-            } else {
-              connect();
-            }
-          }}
-        >
-          Reconectar
+        <button type="button" className="btn primary" onClick={handleReconnect}>
+          {hostOffline ? 'Reintentar conexión' : 'Reconectar'}
         </button>
         <button type="button" className="btn" onClick={disconnect}>
           Volver al inicio
@@ -969,9 +1146,9 @@ const App: React.FC = () => {
       <span className="build-version">v{APP_VERSION}</span>
       <header className="session-bar">
         <span className="session-name">{sessionName}</span>
-        <span className={`pill ${status}`}>
-          {STATUS_TOOLTIP[status]}
-          {detail && ` — ${detail}`}
+        <span className={`pill ${hostOffline ? 'offline' : status}`}>
+          {hostOffline ? 'PC Offline' : STATUS_TOOLTIP[status]}
+          {!hostOffline && detail && ` — ${detail}`}
         </span>
         {status === 'connected' && !audioOnlySession && (
           <button

@@ -4,11 +4,14 @@ import {
   deleteField,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   orderBy,
   query,
   setDoc,
   updateDoc,
+  where,
+  writeBatch,
   type DocumentData,
   type DocumentReference,
   type DocumentSnapshot,
@@ -52,6 +55,12 @@ export interface SessionDoc {
   token?: string;
   /** Motivo por el que el host rechazó la conexión (p. ej. par_token_invalid). */
   rejected?: string;
+  /**
+   * Identificador del intento de negociación actual. Lo genera el cliente (que
+   * es quien ofrece), viaja en offer/answer y etiqueta los documentos de
+   * candidatos para que cada peer descarte los de intentos anteriores.
+   */
+  attemptId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,9 +96,57 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 
 const CHANNEL_NAME = "control";
 
+/**
+ * Margen que se le da a ICE en `disconnected` antes de declarar la caída. Ese
+ * estado es transitorio (se recupera solo tras un parpadeo de red o un cambio
+ * de Wi-Fi), pero si la PC remota se apaga es DEFINITIVO: el puerto se queda
+ * sin respuesta y nunca vuelve a `connected`. Con 8 s detectamos el apagado
+ * mucho antes que el keepalive (15 s) y la UI puede mostrar "PC Offline".
+ */
+const ICE_LOST_GRACE_MS = 8_000;
+
+/** Motivos de cierre que, para el operador, significan "la PC remota no está". */
+export const HOST_OFFLINE_REASONS: ReadonlySet<string> = new Set([
+  "host_offline",
+  "keepalive_timeout",
+  "connection_failed",
+]);
+
+/**
+ * Antigüedad mínima de un candidato para que la purga lo considere basura. El
+ * margen es deliberadamente amplio: la purga corre al arrancar el host, que es
+ * justo cuando un cliente puede estar escribiendo su oferta y sus candidatos.
+ * Descartar candidatos viejos no depende de esto (eso lo hace `attemptId`), así
+ * que podemos serConservadores y no arriesgar una carrera.
+ */
+const CANDIDATE_PURGE_GRACE_MS = 2 * 60 * 1000;
+
+/** Máximo de borrados por batch de Firestore. */
+const FIRESTORE_BATCH_LIMIT = 500;
+
 /** true si la oferta SDP no incluye ninguna sección `m=video` (sesión solo bocina). */
 function isAudioOnlyOffer(sdp: string): boolean {
   return !sdp.split(/\r?\n/).some((line) => line.startsWith("m=video"));
+}
+
+/**
+ * Un candidato pertenece al intento vigente solo si trae el mismo `attemptId`.
+ * Los candidatos de intentos anteriores se descartan: apuntan a un peer
+ * connection ya muerto y ensucian el estado ICE actual (y hacen que la
+ * negociación sea más lenta al procesarlos).
+ *
+ * Casos ambiguos que se aceptan a propósito:
+ * - `attemptId` desconocido todavía (el offer del otro peer aún no llegó): no se
+ *   puede filtrar todavía, así que el candidato se encola y el filtro definitivo
+ *   se aplica al vaciar la cola (justo cuando ya se sabe el intento).
+ * - Candidato sin `attemptId` (peer de una versión anterior): no hay forma de
+ *   atribuirlos; rechazarlos rompería la conexión.
+ */
+function isCandidateForAttempt(data: IceCandidateDoc, attemptId: string): boolean {
+  if (!attemptId || !data.attemptId) {
+    return true;
+  }
+  return data.attemptId === attemptId;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +175,12 @@ export interface IceCandidateDoc {
   sdpMLineIndex: number | null;
   candidate: string;
   at: number;
+  /**
+   * Intento de negociación al que pertenece el candidato. Los candidatos de
+   * intentos anteriores se ignoran (y no se reinyectan en el `pc` actual).
+   * Opcional por compatibilidad con hosts previos a este campo.
+   */
+  attemptId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +244,8 @@ export class HostPeer {
   private seenCandidates = new Set<string>();
   /** Candidatos remotos que llegaron antes del remote description (trickle). */
   private pendingCandidates: IceCandidateDoc[] = [];
+  /** Intento de negociación que está sirviendo este host (el del offer recibido). */
+  private attemptId = '';
   private waitTimer: ReturnType<typeof setTimeout> | null = null;
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private lastClientActivityAt = 0;
@@ -224,6 +289,7 @@ export class HostPeer {
         offer: deleteField(),
         answer: deleteField(),
         rejected: deleteField(),
+        attemptId: deleteField(),
         ...(this.secret
           ? {}
           : { expiresAt: now + this.waitTimeoutMs }),
@@ -231,6 +297,11 @@ export class HostPeer {
       { merge: true },
     );
     this.onStatus("waiting", this.code);
+
+    // Cada arranque del host es un ciclo limpio de negociación: los candidatos
+    // de ciclos anteriores ya no sirven (el `attemptId` los descarta igual, pero
+    // siguen ocupando espacio y lecturas en cada snapshot futuro).
+    void this.purgeStaleCandidates();
 
     this.pc = new RTCPeerConnection({ iceServers: this.iceServers });
     this.pc.onicecandidate = (ev) => {
@@ -404,6 +475,7 @@ export class HostPeer {
           sdpMLineIndex: candidate.sdpMLineIndex,
           candidate: candidate.candidate,
           at: Date.now(),
+          attemptId: this.attemptId,
         },
       );
     } catch (err) {
@@ -411,15 +483,52 @@ export class HostPeer {
     }
   }
 
+  /**
+   * Borra los candidatos más viejos que `CANDIDATE_PURGE_GRACE_MS`. Sin esto las
+   * subcolecciones crecen para siempre: cada reconexión vuelve a subir los
+   * candidatos (el `seenCandidates` es por intento) y el TTL de Firestore solo
+   * borra el documento padre, nunca las subcolecciones.
+   */
+  private async purgeStaleCandidates(): Promise<void> {
+    const cutoff = Date.now() - CANDIDATE_PURGE_GRACE_MS;
+    for (const name of ["clientCandidates", "hostCandidates"]) {
+      try {
+        const snap = await getDocs(
+          query(
+            collection(this.db, FIRESTORE_COLLECTION, this.code, name),
+            where("at", "<=", cutoff),
+          ),
+        );
+        for (let i = 0; i < snap.docs.length; i += FIRESTORE_BATCH_LIMIT) {
+          const batch = writeBatch(this.db);
+          for (const stale of snap.docs.slice(i, i + FIRESTORE_BATCH_LIMIT)) {
+            batch.delete(stale.ref);
+          }
+          await batch.commit();
+        }
+        if (snap.size > 0) {
+          console.log(`[HostPeer/${this.code}] purga ${name}: ${snap.size} candidatos viejos`);
+        }
+      } catch (err) {
+        // Purga es higiene, no función crítica: si falla, el filtro por
+        // attemptId sigue impidiendo que los candidatos viejos se apliquen.
+        console.warn(`[HostPeer/${this.code}] purge ${name} error:`, err);
+      }
+    }
+  }
+
   private handleSessionDoc(snap: DocumentSnapshot<DocumentData>): void {
     if (!snap.exists()) {
       return;
     }
-    const data = snap.data() as { offer?: string; token?: string };
+    const data = snap.data() as { offer?: string; token?: string; attemptId?: string };
     if (!data.offer || data.offer === this.lastOffer) {
       return;
     }
     this.lastOffer = data.offer;
+    // El intento vigente es el del offer que vamos a contestar: desde ahora los
+    // candidatos del host se etiquetan con él y se descartan los de otros.
+    this.attemptId = data.attemptId ?? '';
     if (this.secret) {
       // Modo emparejado: solo contestamos si el cliente prueba identidad.
       void sha256Hex(this.secret)
@@ -529,6 +638,8 @@ export class HostPeer {
         answer: JSON.stringify(answer),
         status: "signaling",
         updatedAt: Date.now(),
+        // Se devuelve el id del intento para que el cliente lo pueda cotejar.
+        ...(this.attemptId ? { attemptId: this.attemptId } : {}),
       });
     } catch (err) {
       console.error(`[HostPeer/${this.code}] answer error:`, err);
@@ -540,6 +651,9 @@ export class HostPeer {
     for (const item of snap.docs) {
       const data = item.data() as IceCandidateDoc;
       if (!data.candidate || this.seenCandidates.has(data.candidate)) {
+        continue;
+      }
+      if (!isCandidateForAttempt(data, this.attemptId)) {
         continue;
       }
       // Los candidatos pueden llegar ANTES de que haya remoteDescription
@@ -561,6 +675,14 @@ export class HostPeer {
     const pending = this.pendingCandidates;
     this.pendingCandidates = [];
     for (const candidate of pending) {
+      // Ahora sí se sabe qué intento se está sirviendo: los encolados de antes
+      // son basura y no deben entrar al pc actual.
+      if (!isCandidateForAttempt(candidate, this.attemptId)) {
+        console.log(
+          `[HostPeer/${this.code}] candidato descartado por intento obsoleto (${candidate.attemptId})`,
+        );
+        continue;
+      }
       void this.addRemoteCandidate(candidate);
     }
   }
@@ -671,8 +793,13 @@ export class ClientPeer {
   private seenCandidates = new Set<string>();
   /** Candidatos remotos que llegaron antes del remote description (trickle). */
   private pendingCandidates: IceCandidateDoc[] = [];
+  /** Id del intento de negociación en curso. Lo genera el cliente (es quien
+   *  ofrece) y viaja en el offer; el host lo devuelve en el answer. Etiqueta
+   *  nuestros candidatos y filtra los del host. */
+  private attemptId = '';
   private timer: ReturnType<typeof setTimeout> | null = null;
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private iceLostTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPongAt = 0;
   private keepaliveLogged = false;
 
@@ -726,6 +853,9 @@ export class ClientPeer {
     }
 
     this.onStatus("signaling", this.code);
+    // Nuevo intento de negociación: id propio para etiquetar nuestros
+    // candidatos y descartar los que el host dejó en intentos anteriores.
+    this.attemptId = generateSessionCode(12);
     this.pc = new RTCPeerConnection({ iceServers: this.iceServers });
     this.pc.onicecandidate = (ev) => {
       if (ev.candidate) {
@@ -778,6 +908,8 @@ export class ClientPeer {
       const patch: Record<string, unknown> = {
         offer: JSON.stringify(offer),
         updatedAt: Date.now(),
+        // El host lo copia al answer y lo usa para etiquetar sus candidatos.
+        attemptId: this.attemptId,
       };
       if (this.secret) {
         patch.token = await sha256Hex(this.secret);
@@ -812,6 +944,10 @@ export class ClientPeer {
     if (this.keepaliveTimer) {
       clearInterval(this.keepaliveTimer);
       this.keepaliveTimer = null;
+    }
+    if (this.iceLostTimer) {
+      clearTimeout(this.iceLostTimer);
+      this.iceLostTimer = null;
     }
     this.unsubDoc?.();
     this.unsubCandidates?.();
@@ -878,6 +1014,14 @@ export class ClientPeer {
     };
     dc.onclose = () => {
       this.onChannelState?.(false);
+      // El canal se cerró sin que nosotros lo pidamos: el host cerró/apagó su app
+      // (o se cayó la conexión). Antes solo se registraba y el cliente quedaba
+      // "Conectado" con un frame congelado hasta que lo mataba el keepalive
+      // (15 s). Cerramos ya para que la UI muestre el fallback "PC Offline".
+      if (!this.stopped && this.dc === dc) {
+        console.warn(`[ClientPeer/${this.code}] canal cerrado por el peer remoto; sesión caída`);
+        void this.stop("host_offline").catch(() => undefined);
+      }
     };
     dc.onmessage = (ev) => {
       const msg = decodeDataChannelMessage(ev.data);
@@ -933,6 +1077,7 @@ export class ClientPeer {
           sdpMLineIndex: candidate.sdpMLineIndex,
           candidate: candidate.candidate,
           at: Date.now(),
+          attemptId: this.attemptId,
         },
       );
     } catch (err) {
@@ -944,9 +1089,22 @@ export class ClientPeer {
     if (!snap.exists()) {
       return;
     }
-    const data = snap.data() as { answer?: string; status?: string; rejected?: string };
+    const data = snap.data() as {
+      answer?: string;
+      status?: string;
+      rejected?: string;
+      attemptId?: string;
+    };
     if (data.answer && !this.answerReceived) {
       this.answerReceived = true;
+      // El host confirma el intento en curso. Solo lo adoptamos si coincide con
+      // el nuestro: si no, es la respuesta de una negociación vieja.
+      if (data.attemptId && data.attemptId !== this.attemptId) {
+        console.warn(
+          `[ClientPeer/${this.code}] answer de otro intento (${data.attemptId} != ${this.attemptId}); ignorada`,
+        );
+        return;
+      }
       void this.setRemoteAnswer(data.answer);
     }
     if (data.status === "rejected") {
@@ -985,6 +1143,9 @@ export class ClientPeer {
       if (!data.candidate || this.seenCandidates.has(data.candidate)) {
         continue;
       }
+      if (!isCandidateForAttempt(data, this.attemptId)) {
+        continue;
+      }
       // Los candidatos pueden llegar ANTES de que haya remoteDescription
       // (trickle + doc) y addIceCandidate los rechaza. Si los marcamos como
       // vistos y no los reaplicamos, la conexión queda coja y se cae con
@@ -1003,6 +1164,14 @@ export class ClientPeer {
     const pending = this.pendingCandidates;
     this.pendingCandidates = [];
     for (const candidate of pending) {
+      // Ahora sí se sabe qué intento se está sirviendo: los encolados de antes
+      // son basura y no deben entrar al pc actual.
+      if (!isCandidateForAttempt(candidate, this.attemptId)) {
+        console.log(
+          `[ClientPeer/${this.code}] candidato descartado por intento obsoleto (${candidate.attemptId})`,
+        );
+        continue;
+      }
       void this.addRemoteCandidate(candidate);
     }
   }
@@ -1032,17 +1201,49 @@ export class ClientPeer {
           clearTimeout(this.timer);
           this.timer = null;
         }
+        this.clearIceLostTimer();
         this.onStatus("connected", this.code);
         break;
       case "failed":
         this.onStatus("error", "connection_failed");
         break;
+      case "disconnected":
+        // Caída de transporte: el host se apagó, se quedó sin red o el camino
+        // cambió. Es transitorio, así que damos un margen (si vuelve a
+        // "connected" se cancela) antes de declararlo PC apagada.
+        this.scheduleIceLost();
+        break;
       case "closed":
         this.onStatus("ended");
         break;
-      // "disconnected" es transitorio; el keepalive decide si hubo caída real.
       default:
         break;
+    }
+  }
+
+  /** Programa la declaración de "PC Offline" tras `ICE_LOST_GRACE_MS` en `disconnected`. */
+  private scheduleIceLost(): void {
+    if (this.iceLostTimer || this.stopped) {
+      return;
+    }
+    console.warn(`[ClientPeer/${this.code}] ICE disconnected; esperando ${ICE_LOST_GRACE_MS}ms`);
+    this.iceLostTimer = setTimeout(() => {
+      this.iceLostTimer = null;
+      if (this.stopped || !this.pc) {
+        return;
+      }
+      // Si el estado volvió a connected/failed mientras esperábamos, otro
+      // manejador ya decidió qué hacer y esta alarma queda invalidada.
+      if (this.pc.connectionState === "disconnected") {
+        void this.stop("host_offline").catch(() => undefined);
+      }
+    }, ICE_LOST_GRACE_MS);
+  }
+
+  private clearIceLostTimer(): void {
+    if (this.iceLostTimer) {
+      clearTimeout(this.iceLostTimer);
+      this.iceLostTimer = null;
     }
   }
 }
