@@ -296,6 +296,12 @@ body {
   font-size: 0.82rem;
 }
 
+.lost-wake-msg {
+  margin: 0;
+  color: #f59e0b;
+  font-size: 0.85rem;
+}
+
 .quality {
   position: absolute;
   bottom: 8px;
@@ -431,6 +437,52 @@ body {
   color: #6b7280;
 }
 
+.pair-card-presence {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: #9ca3af;
+  margin-top: 0.1rem;
+}
+
+.pair-presence-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: #9ca3af;
+}
+
+.pair-card-presence.on .pair-presence-dot {
+  background: #22c55e;
+  box-shadow: 0 0 5px rgba(34, 197, 94, 0.7);
+}
+
+.pair-card-presence.off .pair-presence-dot {
+  background: #4b5563;
+}
+
+.pair-card-presence.stale .pair-presence-dot,
+.pair-card-presence.absent .pair-presence-dot {
+  background: #f59e0b;
+}
+
+.pair-card-presence.error .pair-presence-dot {
+  background: #f2555a;
+}
+
+.pair-card-presence.checking .pair-presence-dot {
+  background: #3a7dff;
+  animation: offline-pulse 1.6s ease-in-out infinite;
+}
+
+.pair-card-wake-note {
+  font-size: 0.7rem;
+  color: #9ca3af;
+  margin-top: 0.05rem;
+}
+
 .pair-card-actions {
   display: flex;
   align-items: center;
@@ -471,6 +523,12 @@ body {
   border-color: #22c55e;
   background: rgba(34, 197, 94, 0.15);
   color: #22c55e;
+}
+
+.pair-action.power:hover {
+  border-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
 }
 
 .btn.ghost.remove {

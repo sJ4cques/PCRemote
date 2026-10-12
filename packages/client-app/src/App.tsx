@@ -6,7 +6,13 @@ import {
   getFirebaseDb,
   normalizeKey,
   HOST_OFFLINE_REASONS,
+  isPresenceFresh,
+  isHostPoweredOn,
+  presenceSummary,
+  readHostPresence,
+  sendWakeCommand,
   type DataChannelMessage,
+  type HostPresenceSnapshot,
   type MouseAction,
   type MouseButton,
   type PeerStatus,
@@ -57,10 +63,36 @@ function toMouseButton(button: number): MouseButton {
   return (['left', 'middle', 'right'] as const)[button] ?? 'left';
 }
 
+/** Estado de presencia que muestra la card de cada equipo emparejado. */
+type PairPresence = {
+  /** 'checking' mientras la primera lectura está en vuelo. */
+  status: 'checking' | 'on' | 'off' | 'stale' | 'absent' | 'error';
+  label: string;
+  /** Solo informativo: último botón/mensaje del encendido reciente. */
+  wakeNote?: string;
+};
+
+function presenceFor(snap: HostPresenceSnapshot | null): PairPresence {
+  if (snap === null) {
+    return { status: 'absent', label: 'Sin datos · el host nunca publicó (¿está apagado?)' };
+  }
+  if (!isPresenceFresh(snap)) {
+    return { status: 'stale', label: presenceSummary(snap) };
+  }
+  if (!isHostPoweredOn(snap)) {
+    return { status: 'off', label: presenceSummary(snap) };
+  }
+  return { status: 'on', label: presenceSummary(snap) };
+}
+
 const App: React.FC = () => {
   const [view, setView] = useState<'dashboard' | 'session'>('dashboard');
   const [sessionName, setSessionName] = useState('');
   const [pairs, setPairs] = useState<SavedPair[]>([]);
+  /** Presencia pasiva del host por equipo emparejado (`presence/{hostId}`). */
+  const [presences, setPresences] = useState<Record<string, PairPresence>>({});
+  /** Feedback del encendido WoL en la vista de sesión (overlay PC Offline). */
+  const [sessionWakeMsg, setSessionWakeMsg] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState('');
   const [newId, setNewId] = useState('');
@@ -132,6 +164,10 @@ const App: React.FC = () => {
    *  negociación se eterniza (típico: el host está apagado pero su sesión
    *  emparejada sigue publicada en Firestore, así que no da error). */
   const silenceTimerRef = useRef<number | null>(null);
+  /** Puntero a `handleReconnect` para el reintento diferido tras encender por
+   *  WoL desde el overlay (el timer se programa en `handleWakeFromSession`, que
+   *  se crea antes que `handleReconnect`). */
+  const reconnectAfterWakeRef = useRef<() => void>(() => undefined);
   /** Sesión "solo bocina": se recibe solo audio, sin control remoto. */
   const audioOnlyRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -146,6 +182,97 @@ const App: React.FC = () => {
   useEffect(() => {
     refreshPairs();
   }, [refreshPairs]);
+
+  /** Relee `presence/{hostId}` de todos los equipos emparejados. Barato: solo
+   *  lecturas, sin tocar la cuota de escritura de Firestore. NUNCA lanza:
+   *  un doc inexistente (host apagado / nunca encendido) sale como "absent" y
+   *  un error de red como "sin datos"; el próximo ciclo lo reintenta. */
+  const refreshPresences = useCallback(async () => {
+    if (pairs.length === 0) {
+      return;
+    }
+    const db = getFirebaseDb();
+    const next: Record<string, PairPresence> = {};
+    await Promise.all(
+      pairs.map(async (pair) => {
+        const snap = await readHostPresence(db, pair.id);
+        next[pair.id] = presenceFor(snap);
+      }),
+    );
+    setPresences(next);
+  }, [pairs]);
+
+  // Polling pasivo mientras estamos en el dashboard (una lectura por equipo
+  // cada 30 s; el host publica su heartbeat cada 5 min, así que nunca se
+  // pierde una transición de estado apagado→encendido/encendido→apagado).
+  useEffect(() => {
+    if (view !== 'dashboard') {
+      return;
+    }
+    void refreshPresences();
+    const timer = window.setInterval(() => void refreshPresences(), 30_000);
+    return () => window.clearInterval(timer);
+  }, [view, refreshPresences]);
+
+  /** Escribe el comando WoL que escucha la tableta y actualiza el feedback de
+   *  la card. Queda una nota visible ~20 s y se re-chequea presencia para
+   *  reflejar el arranque. */
+  const handleWake = useCallback(
+    (pairId: string) => {
+      setPresences((prev) => ({
+        ...prev,
+        [pairId]: {
+          ...(prev[pairId] ?? { status: 'checking', label: 'Consultando…' }),
+          wakeNote: 'Enviando orden a la tableta…',
+        },
+      }));
+      void sendWakeCommand(getFirebaseDb(), 'client')
+        .then(() => {
+          setPresences((prev) => ({
+            ...prev,
+            [pairId]: {
+              ...(prev[pairId] ?? { status: 'checking', label: '' }),
+              wakeNote: 'Orden enviada. La tableta manda el WoL; arrancar puede tardar ~30 s.',
+            },
+          }));
+          window.setTimeout(() => void refreshPresences(), 8_000);
+          window.setTimeout(() => void refreshPresences(), 45_000);
+          window.setTimeout(() => {
+            setPresences((prev) => {
+              const next = { ...prev };
+              const p = next[pairId];
+              if (p) {
+                next[pairId] = { ...p, wakeNote: undefined };
+              }
+              return next;
+            });
+          }, 20_000);
+        })
+        .catch(() =>
+          setPresences((prev) => ({
+            ...prev,
+            [pairId]: {
+              ...(prev[pairId] ?? { status: 'error', label: '' }),
+              wakeNote: 'No se pudo escribir en Firestore (¿reglas o red?).',
+            },
+          })),
+        );
+    },
+    [refreshPresences],
+  );
+
+  /** Variante del overlay "PC Offline": encender desde dentro de la sesión y,
+   *  si hay equipo activo, reintentar la conexión poco después (cuando ya
+   *  arrancó). */
+  const handleWakeFromSession = useCallback(() => {
+    setSessionWakeMsg('Enviando orden a la tableta…');
+    void sendWakeCommand(getFirebaseDb(), 'client')
+      .then(() => {
+        setSessionWakeMsg('Orden enviada. La tableta manda el WoL; la PC puede tardar ~30 s en arrancar.');
+        window.setTimeout(() => reconnectAfterWakeRef.current?.(), 45_000);
+      })
+      .catch(() => setSessionWakeMsg('No se pudo escribir en Firestore (¿red?). Reintentá manualmente.'));
+  }, []);
 
   const toggleFullscreen = useCallback(() => {
     setFullscreen((prev) => {
@@ -960,6 +1087,12 @@ const App: React.FC = () => {
     }
   }, [pairs, connect, handleConnectAudio, handleConnectPair]);
 
+  // El reintento diferido del WoL (overlay PC Offline) usa SIEMPRE la última
+  // versión de `handleReconnect` aunque el timer se programó antes.
+  useEffect(() => {
+    reconnectAfterWakeRef.current = handleReconnect;
+  }, [handleReconnect]);
+
   /** Explicación del fallback según por qué se cayó la sesión. */
   const offlineHint = (): string => {
     if (!online) {
@@ -1000,7 +1133,13 @@ const App: React.FC = () => {
       </p>
       {hostOffline && <p className="lost-hint">{offlineHint()}</p>}
       {hostOffline && retryInfo && <p className="lost-retry">{retryInfo}</p>}
+      {hostOffline && sessionWakeMsg && <p className="lost-wake-msg">{sessionWakeMsg}</p>}
       <div className="lost-actions">
+        {hostOffline && (
+          <button type="button" className="btn" onClick={handleWakeFromSession}>
+            ⚡ Encender vía tableta (WoL)
+          </button>
+        )}
         <button type="button" className="btn primary" onClick={handleReconnect}>
           {hostOffline ? 'Reintentar conexión' : 'Reconectar'}
         </button>
@@ -1045,8 +1184,33 @@ const App: React.FC = () => {
               <span className="pair-card-name">{pair.name}</span>
               <span className="pair-card-id">{pair.id}</span>
               <span className="pair-card-last muted">{formatLastConnected(pair.lastConnectedAt)}</span>
+              {(() => {
+                const p = presences[pair.id];
+                return (
+                  <>
+                    <span className={`pair-card-presence ${p?.status ?? 'checking'}`}>
+                      <span className="pair-presence-dot" aria-hidden="true" />
+                      <span className="pair-presence-text">{p?.label ?? 'Consultando…'}</span>
+                    </span>
+                    {p?.wakeNote ? <span className="pair-card-wake-note muted">{p.wakeNote}</span> : null}
+                  </>
+                );
+              })()}
             </div>
             <div className="pair-card-actions">
+              <button
+                type="button"
+                className="pair-action power"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleWake(pair.id);
+                }}
+                title="Encender vía tableta (WoL) si la PC está apagada"
+              >
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+                  <path d="M13 2 4 14h6l-1 8L18 9h-6z" />
+                </svg>
+              </button>
               <button
                 type="button"
                 className="pair-action play"

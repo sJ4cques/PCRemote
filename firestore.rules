@@ -1,0 +1,77 @@
+rules_version = '2';
+
+// ATENCIÓN — LEER ANTES DE DESPLEGAR
+//
+// Estas reglas NO estaban versionadas: hasta ahora vivían solo en la consola de
+// Firebase. Este archivo es una COPIA DEL POSTURE DOCUMENTADO (REQUERIMIENTOS.md
+// §6.1: "clientes pueden escribir en `sessions` y subcolecciones"), no una
+// exportación de lo que hay hoy en la consola.
+//
+// Consecuencia práctica: NO corras `firebase deploy` a secas, porque desplegaría
+// estas reglas y podrían no coincidir con las reales y romper las apps. Para
+// publicar la Function usa siempre `npm run deploy` dentro de
+// `packages/functions`, que sube `--only functions` y no toca las reglas.
+//
+// Cuándo sí haya que desplegar estas reglas: después de comparar el contenido
+// con el de la consola y confirmar que coincide.
+
+// ---------------------------------------------------------------------------
+// Por qué `presence` es abierto
+//
+// El host (Electron) entra con la API key web del SDK, sin Auth: es un cliente
+// anónimo, así que las reglas lo restringen igual que a cualquiera. Y el
+// teléfono de Android usa una cuenta de servicio, que salta las reglas por
+// completo. Es decir: `presence` no puede ser una frontera de seguridad en este
+// diseño.
+//
+// Eso está bien porque `presence` NO decide nada sensible: solo le paints a la
+// UI si la PC está prendida. El único control de abuso real es el rate limit de
+// la Cloud Function (`packages/functions`). El endurecimiento de verdad
+// (Custom Tokens de Firebase Auth en lugar de la service account en el APK)
+// requeriría cambiar la autenticación de las tres apps; hasta entonces, mantener
+// estas reglas abiertas es coherente con el resto del proyecto.
+// ---------------------------------------------------------------------------
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Señalización de sesiones remotas (host Windows + cliente macOS).
+    match /sessions/{code} {
+      allow read, write: if true;
+
+      match /{document=**} {
+        allow read, write: if true;
+      }
+    }
+
+    // Presencia del host y probe bajo demanda.
+    match /presence/{machineId} {
+      allow read, write: if true;
+
+      match /{document=**} {
+        allow read, write: if true;
+      }
+    }
+
+    // Comando de encendido WoL: la tableta escucha `pc_commands/desktop`
+    // (powerOn=true + timestamp) para mandar el magic packet. El teléfono y el
+    // cliente de escritorio (SDK web anónimo) lo escriben; la tableta usa su
+    // service account y salta estas reglas. Mismo modelo de confianza que
+    // `presence`/`sessions`: abierto por diseño, no decide nada sensible.
+    // ATENCIÓN: si el archivo no coincide con la consola, desplegar SOLO
+    // estas reglas (`firebase deploy --only firestore:rules`).
+    match /pc_commands/{docId} {
+      allow read, write: if true;
+    }
+
+    // Verificación de conectividad usada por `pingFirestore()`.
+    match /_healthcheck/{doc} {
+      allow read, write: if true;
+    }
+
+    // Por defecto cerrado.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

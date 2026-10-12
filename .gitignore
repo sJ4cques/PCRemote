@@ -7,3 +7,11 @@ out/
 .env.*
 !.env.example
 firebase-admin.json
+
+# Salida compilada de packages/functions (el deploy sube lib/, pero no se versiona)
+packages/functions/lib/
+# Emuladores locales de Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log

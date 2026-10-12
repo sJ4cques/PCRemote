@@ -48,6 +48,14 @@ manual por código** (opcionalmente con PIN) y **emparejamiento persistente**.
 - Operar en **modo servicio**: ventana oculta, arranque automático con Windows y re-escucha continua.
 - Recuperar el control remoto ante input congelado (reinicio del pipeline de entrada sin cortar video).
 - Brindar calidad de conexión observable en el cliente (RTT, bitrate, fps).
+- **Heartbeat de presencia** del host y **liveness pasiva** en la app Android, para que el teléfono y la
+  tablet vean si la PC está prendida sin gastar una consulta de probe (solo lecturas baratas en Firestore).
+- **Publicación de la IP LAN actual** del host en `presence/{hostId}.lastLocalIp` (recuperable por DHCP
+  renoveado: cada latido/loopea). Permite que la app Android (emparejada) haga su chequeo LAN directo al
+  router sin depender de IP estática.
+- **Emparejado en la app Android** (teléfono y tablet) opcional: pedir el `hostId` y `secret` que muestra
+  el panel del host para apuntar a `presence/{hostId}` en vez del default `presence/desktop`, análogo al
+  cliente Electron.
 
 ---
 
@@ -265,6 +273,85 @@ Los casos de uso se identifican con prefijo **CU**, un **ID** asociado (RF-XX), 
   cualquiera de los dos se envía `bye` para liberación inmediata.
 - **Postcondiciones:** no quedan sesiones ocupadas fantasma; el cliente muestra la pérdida de conexión.
 
+### CU-14b · Heartbeat de presencia (liveness pasiva) — RF-14b
+
+- **Descripción:** el host actualiza periódicamente `presence/{hostId}` para que la app Android (teléfono y
+  tablet) pueda enterarse de si la PC está viva sin necesidad de escribir un probe. Además publica su IP
+  LAN actual en `lastLocalIp`.
+- **Autor:** Sistema (host).
+- **Precondiciones:** host iniciado, Firestore accesible.
+- **Escenario:**
+  1. El `machineId` del doc NO es el literal `"desktop"`: es el `hostId` configurado del emparejado del
+     host. Esto le da al Android un target por PC y permite que múltiples PCs no se pisen.
+  2. Cada `PRESENCE_HEARTBEAT_MS` (5 min) el host corre un health check (`desktopCapturer` + `powerMonitor`)
+     y reescribe `presence/{hostId}` con `state`, `bootId`, `lastEventAt`, `lastHeartbeatAt`,
+     `lastLocalIp`, `captureOk`, `idle`. La IP se toma de `os.networkInterfaces()` filtrando adaptadores
+     virtuales (VMware/Docker/WSL/Hyper‑V/TUN/TAP); se republca con cada latido, así un DHCP renoveado
+     se ve antes de los 5 min siguientes.
+  3. Los eventos de `powerMonitor` (boot, suspend, resume, lock, unlock, shutdown) también publican,
+     así el doc refleja cambios de estado real sin esperar al próximo latido.
+  4. La app Android relee el doc periódicamente (cada `PRESENCE_PASSIVE_POLL_MS` mientras la pantalla está
+     visible; el teléfono la libera cuando se va a background). Son SOLO LECTURAS: no gastan cuota de
+     escritura ni entran al rate limit de la Cloud Function.
+  5. Si `lastHeartbeatAt` es más viejo que `PRESENCE_STALE_AFTER_MS` (10 min) la UI muestra "sin señal"
+     aunque el último `state` diga `online` (la red entre el host y Firestore puede haber caído).
+  6. La app Android tablet, además, empuja `lastLocalIp` al `PcPollingLoop` (`set_presence_ip`) cuando
+     cambia: el chequeo LAN (TCP/ping) apunta a la IP fresca antes de caer a la IP configurada a mano
+     y al auto‑descubrimiento por MAC.
+  7. El probe bajo demanda (CU-01/CU-02) sigue siendo la fuente autoritativa para confirmar operabilidad
+     instantánea; el heartbeat es la señal barata y pasiva para "está viva".
+- **Postcondiciones:** la app puede decir "operativa / bloqueada / degradada / suspendida" sin gastar una
+  sola escritura, y el chequeo LAN usa la IP actual del host aunque el router la haya renoveado. Si el
+  usuario regenera el emparejado (CU-05), el path de `presence` cambia: el Android viejo deja de ver
+  este host hasta re‑emparejar (consistente con el cliente Electron).
+
+### CU-14c · Emparejado de la app Android (opcional) — RF-14c
+
+- **Descripción:** la app Android (teléfono y tablet) permite al usuario tipear el `hostId` y `secret`
+  que muestra el panel del host para apuntar sus operaciones a `presence/{hostId}` en lugar del
+  default `presence/desktop`. Análogo al emparejado del cliente Electron.
+- **Autor:** Usuario Android.
+- **Precondiciones:** host IsisAnubis ya generado un par (visible en su panel).
+- **Escenario:**
+  1. `Settings → Emparejado con PC`: dos campos (ID del equipo 8 chars, Secreto 8 chars) y botones
+     "Guardar emparejado", "Validar" y "Quitar emparejado".
+  2. Al guardar, la app empuja el `machineId` al Python (`configurar_objetivo(<hostId>)`); las próximas
+     operaciones de `leer_presencia_host` / `solicitar_probe` caen en `presence/{hostId}/...`.
+  3. "Validar" lee el doc y muestra `Conectado · <deviceName> · v<AppVersion>` o el motivo de fallo
+     (host no encendido / sin red / ID incorrecto).
+  4. Sin emparejar, la app vuelve al modo manual: target `presence/desktop`, ID/Secreto vacíos.
+  5. El teléfono, antes de mandar un probe, vuelve a llamar `configurar_objetivo` para cubrir el caso
+     "cambié emparejado en Settings, toqué Consultar" sin esperar al próximo tick de polling pasivo.
+- **Postcondiciones:** se elimina la ambigüedad de múltiples PCs compartiendo un mismo `presence/desktop`;
+  el emparejado es persistente (Android SharedPreferences locales, no se guarda en Firestore).
+
+### CU-14d · Estado del host y encendido (WoL) desde el cliente — RF-14d
+
+- **Descripción:** el cliente Electron muestra si el equipo emparejado está encendido (presencia pasiva,
+  sin escribir) y permite mandarle la orden de encendido a la tableta cuando está apagado. Reutiliza el
+  mismo `presence/{hostId}` del heartbeat (CU-14b) y el mismo comando WoL que ya usa el teléfono
+  (`pc_commands/desktop`), así no hace falta tocar la app Android.
+- **Autor:** Usuario del cliente (equipo que controla).
+- **Precondiciones:** host emparejado con el cliente (mismo `hostId`), y una tableta en modo tablet
+  escuchando `pc_commands/desktop` para mandar el magic packet.
+- **Escenario:**
+  1. En el dashboard, la card de cada equipo muestra un punto de presencia + etiqueta leída de
+     `presence/{hostId}`: `Encendida` / `Encendida (bloqueada)` / `Sin señal (hace N min)` / `Sin datos`.
+     El polling es pasivo (1 lectura por equipo cada 30 s; el heartbeat del host es cada 5 min).
+  2. Si la PC está apagada o sin señal, el usuario pulsa el botón ⚡ de la card (o "Encender vía tableta
+     (WoL)" en el overlay "PC Offline" de una sesión caída).
+  3. El cliente escribe `pc_commands/desktop` con `powerOn=true`, `timestamp` fresco y
+     `senderDevice="client"` (merge, sin pisar `pcOnline/pcCheckedAt`). La tableta detecta el timestamp
+     nuevo y dispara WoL a la MAC/broadcast configurados.
+  4. El cliente re-chequea presencia a los ~8 s y ~45 s y muestra feedback en la UI; desde la sesión
+     caída, además reintenta la conexión pasados ~45 s para que sea transparente cuando ya arrancó.
+- **Postcondiciones:** se ve el estado del host sin gastar escrituras; el encendido funciona sin tocar la
+  app Android (la tableta ya escucha `pc_commands/desktop`).
+- **Nota de reglas:** `pc_commands` estaba cerrado por defecto; se abre en `firestore.rules` (mismo modelo
+  de confianza que `presence`/`sessions`). Hay que desplegar las reglas a la consola para que el SDK web
+  del cliente pueda escribir (`firebase deploy --only firestore:rules`, previa comparación de
+  `firestore.rules` con la consola).
+
 ### CU-15 · Herramientas de administración de la señalización — RF-15
 
 - **Descripción:** scripts de consola para listar, limpiar y reiniciar sesiones en Firestore.
@@ -298,7 +385,7 @@ Los casos de uso se identifican con prefijo **CU**, un **ID** asociado (RF-XX), 
 | **Escalabilidad** | La señalización usa Firestore serverless (colección `sessions` + subcolecciones de candidatos); sin servidores propios. Una sesión admite un único cliente a la vez (`session_busy`); el crecimiento es horizontal y por cuota de Firebase. |
 | **Disponibilidad** | La señalización depende de la disponibilidad de Firestore (verificada con `pingFirestore` en fase 0). La conexión de medios es **P2P** (WebRTC + STUN) y sobrevive a fallas transitorias de la señalización una vez negociada. Reconexión automática (3 intentos) y re-escucha automática del host ante errores. |
 | **Compatibilidad** | Aplicación **nativa de escritorio multiplataforma asimétrica**: el host solo admite **Windows** (inyección con helper elevado, loopback de audio), el cliente solo **macOS** (modo tapa cerrada); el código compartido (`@isisanubis/shared`) es agnóstico. Electron 44, React 19, Node ≥22, pnpm ≥11 (nodeLinker hoisted). |
-| **Rendimiento esperado** | Captura de pantalla ≤30 fps con balance a ≤1920x1080 en modo legacy; throttle de `move` cada 25 ms y acumulación del wheel cada 80 ms; cola de input acotada (40 eventos) y ejecución serializada; keepalive a 5 s con detección de caída en 15–20 s; watchdog de input: reinicio si una operación supera 3,5 s; negociación con timeout de 90 s en el cliente y TTL de 10 min en sesiones manuales; métricas en vivo (RTT, Mbps, fps) cada 2 s. |
+| **Rendimiento esperado** | Captura de pantalla ≤30 fps con balance a ≤1920x1080 en modo legacy; throttle de `move` cada 25 ms y acumulación del wheel cada 80 ms; cola de input acotada (40 eventos) y ejecución serializada; keepalive a 5 s con detección de caída en 15–20 s; watchdog de input: reinicio si una operación supera 3,5 s; negociación con timeout de 90 s en el cliente y TTL de 10 min en sesiones manuales; métricas en vivo (RTT, Mbps, fps) cada 2 s. El heartbeat de presencia escribe `presence/{machineId}` cada 5 min (≈288 escrituras/día/host, dentro de la capa gratuita) y la app Android relee solo ese doc (lecturas baratas), sin sumar presión al rate limit del probe bajo demanda. |
 
 ---
 
@@ -346,7 +433,7 @@ Los casos de uso se identifican con prefijo **CU**, un **ID** asociado (RF-XX), 
 | --- | --- | --- |
 | **Alta** | CU-01, CU-02, CU-04, CU-06, CU-07 (sesión por código, emparejamiento, streaming de pantalla y control) | Núcleo del producto: sin estos no existe el acceso remoto. |
 | **Alta** | CU-03, CU-05, CU-14 (PIN, regenerar emparejamiento, sesiones fantasma) | Integridad del modelo de confianza y disponibilidad del host. |
-| **Media** | CU-08, CU-09, CU-10, CU-11 (reinicio de input, portapapeles, calidad, reconexión) | Robustez y experiencia de uso; no bloquean la conexión básica. |
+| **Media** | CU-08, CU-09, CU-10, CU-11, CU-14b, CU-14c, CU-14d (reinicio de input, portapapeles, calidad, reconexión, heartbeat pasivo, emparejado Android con IP LAN, estado del host + WoL desde el cliente) | Robustez y experiencia de uso; no bloquean la conexión básica. El heartbeat (CU-14b) es complementario al probe bajo demanda: muestra estado del host en la app Android sin gastar consulta, pero el núcleo sigue siendo el probe activo. El emparejado de la app Android (CU-14c) la apunta a `presence/{hostId}` (en vez del default `desktop`) y desbloquea el chequeo LAN con IP fresca pese a DHCP. El estado + encendido desde el cliente (CU-14d) cierra el bucle de soporte: ver si la PC está arriba y prenderla vía tableta sin tocar la tablet. |
 | **Media** | CU-12, CU-13 (solo bocina, modo servicio/autostart/bandeja) | Escenarios desatendidos y de audio; habilitan el uso productivo continuo. |
 | **Baja** | CU-15, CU-16 (herramientas admin y flags de diagnóstico) | Soportan el desarrollo y la operación, no al usuario final. |
 
@@ -372,6 +459,9 @@ Los casos de uso se identifican con prefijo **CU**, un **ID** asociado (RF-XX), 
 | CU-12 | Una sesión "solo audio" reproduce el sonido del host y, en macOS, mantiene el audio con la tapa cerrada y restaura la configuración al salir. |
 | CU-13 | Con "inicio con Windows" activado, host + helper se lanzan sin consola; "modo servicio" escucha de forma continua. |
 | CU-14 | Un cliente que muere sin avisar libera la sesión en ≤20 s y el estado vuelve a `waiting`/`closed`. |
+| CU-14b | El host actualiza `presence/{hostId}` cada 5 min (o por evento de `powerMonitor`) con `state`, `lastHeartbeatAt`, `lastLocalIp`, etc. El `lastLocalIp` refleja el DHCP renoveado (≤5 min). La app Android (teléfono y tablet) lee ese doc sin escribir y muestra el estado pasivo; si `lastHeartbeatAt` tiene más de 10 min, la UI lo marca como "sin señal" aunque el último `state` diga `online`. La tablet empuja `lastLocalIp` al chequeo LAN (TCP/ping), que cae a la IP configurada a mano si la del host falla. |
+| CU-14c | La app Android emparejada guarda `hostId`+`secret`, apunta probe y presence a `presence/{hostId}` y muestra "Emparejado con <deviceName>" en la UI; al quitarla, vuelve al modo manual sobre `presence/desktop`. Validar pide el doc al host; si no existe o no responde, muestra el motivo y no cambia estado. |
+| CU-14d | El cliente muestra en cada card de equipo el estado leído de `presence/{hostId}` (encendida / bloqueada / sin señal / sin datos) con polling pasivo ≤30 s y sin escrituras. Con la PC apagada, "⚡ Encender" escribe `pc_commands/desktop` (`powerOn=true` + timestamp + `senderDevice="client"`); la tableta manda WoL y el cliente actualiza el estado a "encendida" en ≤2 min. Desde el overlay "PC Offline" se puede encender y se reintenta la conexión pasados ~45 s. |
 | CU-15 | `listSessions` muestra el estado real; `resetSessions`/`cleanSessions` dejan la colección consistente. |
 | CU-16 | Los flags de prueba validan captura, input, clipboard y audio con y sin hardware real. |
 
@@ -382,7 +472,10 @@ Los casos de uso se identifican con prefijo **CU**, un **ID** asociado (RF-XX), 
 - **Pruebas de flags automatizables**: `--isis-simulate-video`, `--isis-fake-input`, `--isis-input-test`,
   `--isis-clipboard-test`, `--isis-audio-only`, `--isis-capture-test` y `--isis-autostop`.
 - **Diagnóstico por logs**: log rotativo `isis-host.log` que vuelca consola del renderer, eventos de
-  captura (`getDisplayMedia`/`legacy`), cambio de estado de sesión y salud del pipeline de input.
+  captura (`getDisplayMedia`/`legacy`), cambio de estado de sesión y salud del pipeline de input. El
+  heartbeat deja trazas en el mismo log (`[presence] powerMonitor ... -> ...`) y puede verificarse
+  inspeccionando `presence/{machineId}` en la consola de Firestore (los campos `state`,
+  `lastHeartbeatAt` y `lastEventAt` deben actualizarse).
 - **Revisión de seguridad**: verificar que no existan secretos en las apps distribuidas ni en Firestore
   (solo hashes), aislamiento `contextIsolation`, y que el helper elevado se limite a la inyección.
 - **Prototipos incrementales**: compilación empaquetada (`electron-forge make`) de host y cliente en sus

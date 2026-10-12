@@ -1,4 +1,30 @@
-export { firebaseConfig, FIRESTORE_COLLECTION, type FirebaseConfig } from "./config";
+export {
+  firebaseConfig,
+  FIRESTORE_COLLECTION,
+  PRESENCE_COLLECTION,
+  PRESENCE_PROBE_SUBCOLLECTION,
+  PRESENCE_MACHINE_ID,
+  PC_COMMANDS_COLLECTION,
+  PC_COMMANDS_DOC_ID,
+  PROBE_RATE_LIMIT_MAX,
+  PROBE_RATE_LIMIT_WINDOW_MS,
+  PROBE_MAX_AGE_MS,
+  PROBE_TIMEOUT_MS,
+  PRESENCE_HEARTBEAT_MS,
+  PRESENCE_STALE_AFTER_MS,
+  PRESENCE_PASSIVE_POLL_MS,
+  type FirebaseConfig,
+} from "./config";
+export {
+  isPresenceFresh,
+  isHostPoweredOn,
+  hostStateLabel,
+  presenceSummary,
+  readHostPresence,
+  sendWakeCommand,
+  type HostState,
+  type HostPresenceSnapshot,
+} from "./presence";
 export { APP_VERSION } from "./version";
 export { getFirebaseDb, pingFirestore } from "./firebase";
 export { FirestoreStatus, type FirestoreStatusValue } from "./FirestoreStatus";

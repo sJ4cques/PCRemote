@@ -15,7 +15,12 @@ import fs from 'node:fs';
 import { exec, spawn } from 'node:child_process';
 import net from 'node:net';
 import started from 'electron-squirrel-startup';
-import { APP_VERSION, type DataChannelMessage } from '@isisanubis/shared';
+import {
+  APP_VERSION,
+  getFirebaseDb,
+  type DataChannelMessage,
+} from '@isisanubis/shared';
+import { startPresence, stopPresence } from './presence';
 
 if (started) {
   app.quit();
@@ -1330,6 +1335,26 @@ app.on('ready', () => {
   const startUi = (): void => {
     createWindow();
     createTray();
+    const cfg = loadConfig();
+    // Presencia: el `machineId` del doc es el MISMO `hostId` del emparejado
+    // (no el literal "desktop"). Esto le da al Android un target por host
+    // físico: cuando el usuario empareja con el ID del panel, el path
+    // `presence/{hostId}` coincide con el que la PC está escribiendo.
+    //
+    // Si el host regenera el emparejamiento (CU-05 en REQUERIMIENTOS), el
+    // path cambia: el Android viejo deja de ver este host hasta que vuelva
+    // a emparejarlo. Aceptable y consistente con cómo se comporta el cliente
+    // Electron al regenerar.
+    try {
+      startPresence(getFirebaseDb(), {
+        machineId: isisHostId ?? cfg.hostId,
+        hostId: isisHostId ?? cfg.hostId,
+        deviceName: cfg.deviceName,
+        log: appendLog,
+      });
+    } catch (err) {
+      appendLog(`[presence] no se pudo iniciar: ${String(err)}`);
+    }
     appendLog(
       `[host] IsisAnubis Host v${APP_VERSION} modo=video-normal desktopAudio=${desktopAudioEnabled() ? 'ON' : 'OFF'} platform=${process.platform} elevado=no input_helper=separado`,
     );
@@ -1348,6 +1373,7 @@ app.on('ready', () => {
 app.on('before-quit', () => {
   allowClose = true;
   stopCursorWatch();
+  stopPresence();
   if (inputHelperFallbackTimer !== null) {
     clearTimeout(inputHelperFallbackTimer);
     inputHelperFallbackTimer = null;

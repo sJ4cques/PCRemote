@@ -35,3 +35,100 @@ export const firebaseConfig: FirebaseConfig = {
 };
 
 export const FIRESTORE_COLLECTION = "sessions";
+
+// ---------------------------------------------------------------------------
+// Presencia bajo demanda ("¿está la PC prendida?")
+//
+// Layout (solo 4 documentos FIJOS; ningún request crea documentos nuevos):
+//
+//   presence/{machineId}                 doc del host: estado, bootId, appVersion
+//   presence/{machineId}/probe/pending   doc del TELÉFONO: pide un chequeo
+//   presence/{machineId}/probe/answer    doc de RESPUESTA (Function o host)
+//   presence/{machineId}/probe/rate      contador de la ventana de rate limit
+//
+// OJO con la aritmética de rutas de Firestore: los números de segmentos impares
+// son COLECCIONES. Por eso los tres docs de probe viven bajo la subcolección
+// `probe` y no directamente bajo `{machineId}`.
+// ---------------------------------------------------------------------------
+
+/** Colección raíz de presencia. */
+export const PRESENCE_COLLECTION = "presence";
+
+/** Subcolección con los tres documentos fijos del probe. */
+export const PRESENCE_PROBE_SUBCOLLECTION = "probe";
+
+/** Identificador de la máquina controlada. Debe coincidir con el que usa la app Android. */
+export const PRESENCE_MACHINE_ID = "desktop";
+
+// ---------------------------------------------------------------------------
+// Comando de encendido WoL que la tableta escucha
+//
+// Layout (un solo doc FIJOS; el teléfono y el cliente de escritorio escriben,
+// la tableta lo relee y dispara el magic packet):
+//
+//   pc_commands/{docId}   powerOn=true + timestamp + senderDevice
+//
+// La app Android (modo tablet) lee `pc_commands/desktop` en su PcPollingLoop:
+// cuando `timestamp` avanza y `powerOn=true`, manda WoL a la MAC/broadcast
+// configurados. El cliente de escritorio usa la MISMA ruta ("desktop") para
+// encender desde el dashboard o desde el overlay "PC Offline". Es single-host
+// por diseño; si algún día hay dos PCs, este doc debería pasar a
+// `pc_commands/{hostId}` y la tablet se emparejaría por host.
+// ---------------------------------------------------------------------------
+
+/** Colección del comando de encendido WoL. */
+export const PC_COMMANDS_COLLECTION = "pc_commands";
+
+/** Doc fijo que la tableta escucha (mismo que usa la app Android). */
+export const PC_COMMANDS_DOC_ID = "desktop";
+
+/** Tope de probes por ventana. Lo aplica la Cloud Function (`packages/functions`). */
+export const PROBE_RATE_LIMIT_MAX = 10;
+
+/** Largo de la ventana del rate limit, en ms. */
+export const PROBE_RATE_LIMIT_WINDOW_MS = 60_000;
+
+/**
+ * Un probe con `dispatchedAt` más viejo que esto se considera caducado y el
+ * host lo ignora: evita que un host que vuelve tarde conteste un pedido viejo.
+ */
+export const PROBE_MAX_AGE_MS = 30_000;
+
+/** Presupuesto de espera del cliente antes de declarar "apagada o encendiendo". */
+export const PROBE_TIMEOUT_MS = 25_000;
+
+// ---------------------------------------------------------------------------
+// Heartbeat del host (liveness pasiva)
+//
+// El host publica `presence/{machineId}` cada vez que ocurre un evento
+// (boot, suspend, lock, unlock, shutdown). Entre eventos, ese doc se queda
+// quieto: para que un cliente pueda enterarse de que la PC sigue viva SIN
+// escribir un probe (y por lo tanto SIN gastar cuota de escritura cuando
+// solo quiere mirar), el host también lo actualiza periódicamente.
+//
+// El campo nuevo es `lastHeartbeatAt`: marca de tiempo del último latido.
+// El Android lo usa para distinguir:
+//
+//   - state='online' + lastHeartbeatAt fresco  -> operativa
+//   - state='online' + lastHeartbeatAt viejo   -> "estuvo operativa" (posible
+//     cuelgue de red entre el host y Firestore)
+//   - state='offline' o sin doc                -> apagada / nunca encendida
+//
+// Cinco minutos es generoso a propósito: es el costo de UNA escritura cada 5
+// minutos (~288/día), casi gratis en la capa gratuita, y le da al cliente
+// margen para absorber una sola escritura perdida antes de mostrar "viejo".
+// ---------------------------------------------------------------------------
+
+/** Cada cuánto el host publica su estado en `presence/{machineId}` aunque no
+ *  haya ocurrido ningún evento. */
+export const PRESENCE_HEARTBEAT_MS = 5 * 60 * 1000;
+
+/** Si `lastHeartbeatAt` es más viejo que esto, el Android considera que el
+ *  host está sin señal aunque el último `state` conocido diga "online". Es 2x
+ *  el heartbeat: aguanta una escritura caída sin parpadear. */
+export const PRESENCE_STALE_AFTER_MS = 10 * 60 * 1000;
+
+/** Cada cuánto el Android relee `presence/{machineId}` cuando solo necesita
+ *  el dato pasivo (sin tocar la cuota). Lo eligen las apps Android según su
+ *  modo (teléfono vs tablet con foreground service). */
+export const PRESENCE_PASSIVE_POLL_MS = 30 * 1000;

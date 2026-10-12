@@ -1,6 +1,5 @@
 import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import type { ForgeConfig } from '@electron-forge/shared-types';
 import { MakerSquirrel } from '@electron-forge/maker-squirrel';
 import { MakerZIP } from '@electron-forge/maker-zip';
@@ -9,21 +8,21 @@ import { VitePlugin } from '@electron-forge/plugin-vite';
 import { FusesPlugin } from '@electron-forge/plugin-fuses';
 import { FuseV1Options, FuseVersion } from '@electron/fuses';
 
-const require_ = createRequire(__filename);
 const ROOT_NODE_MODULES = path.resolve(__dirname, '../../node_modules');
 
-/** Localiza el directorio real de un paquete (pnpm hoisted o .pnpm). */
-function resolvePkgDir(name: string): string | null {
-  const flat = path.join(ROOT_NODE_MODULES, name);
-  if (existsSync(path.join(flat, 'package.json'))) {
-    return flat;
-  }
-  try {
-    const entry = require_.resolve(name, { paths: [ROOT_NODE_MODULES] });
-    let dir = path.dirname(entry);
-    for (let i = 0; i < 6; i += 1) {
-      if (existsSync(path.join(dir, 'package.json'))) {
-        return dir;
+/**
+ * Localiza el directorio real de un paquete tal como lo resolvería Node en
+ * runtime: primero sube desde el directorio del consumidor (manejando los
+ * node_modules anidados de pnpm/npm para versiones en conflicto) y solo como
+ * fallback mira el node_modules raíz del monorepo.
+ */
+function resolvePkgDir(name: string, fromDir: string | null): string | null {
+  if (fromDir) {
+    let dir = fromDir;
+    for (let depth = 0; depth < 16 && dir; depth += 1) {
+      const candidate = path.join(dir, 'node_modules', name);
+      if (existsSync(path.join(candidate, 'package.json'))) {
+        return candidate;
       }
       const up = path.dirname(dir);
       if (up === dir) {
@@ -31,28 +30,45 @@ function resolvePkgDir(name: string): string | null {
       }
       dir = up;
     }
-  } catch {
-    // no existe o no se puede resolver; se omite
+  }
+  const flat = path.join(ROOT_NODE_MODULES, name);
+  if (existsSync(path.join(flat, 'package.json'))) {
+    return flat;
   }
   return null;
 }
 
+interface ClosureEntry {
+  name: string;
+  dir: string | null;
+}
+
 /**
  * Recolecta la clausura de dependencias (dependencies/peer/optional) de una
- * lista de paquetes resolviendo desde el node_modules raíz del monorepo.
+ * lista de paquetes resolviendo CADA dependencia desde el directorio del
+ * paquete que la declara. Resolver siempre desde el node_modules raíz es
+ * incorrecto con layouts hoisted: el raíz puede tener otra versión del mismo
+ * paquete (p.ej. is-wsl v1 hoisted frente a la v2 anidada que clipboardy
+ * requiere) y sus dependencias nunca entran a la clausura -> MODULE_NOT_FOUND
+ * (code=1) al cargar nut-js en el worker empaquetado.
  */
-function dependencyClosure(entries: string[]): string[] {
+function dependencyClosure(entries: string[]): ClosureEntry[] {
   const seen = new Set<string>();
-  const queue = [...entries];
-  const closure: string[] = [];
+  const queue: Array<{ name: string; fromDir: string | null }> = entries.map(
+    (name) => ({ name, fromDir: null }),
+  );
+  const closure: ClosureEntry[] = [];
   while (queue.length > 0) {
-    const name = queue.shift() as string;
+    const { name, fromDir } = queue.shift() as {
+      name: string;
+      fromDir: string | null;
+    };
     if (seen.has(name)) {
       continue;
     }
     seen.add(name);
-    const dir = resolvePkgDir(name);
-    closure.push(name);
+    const dir = resolvePkgDir(name, fromDir);
+    closure.push({ name, dir });
     if (!dir) {
       continue;
     }
@@ -61,13 +77,14 @@ function dependencyClosure(entries: string[]): string[] {
       peerDependencies?: Record<string, string>;
       optionalDependencies?: Record<string, string>;
     };
-    queue.push(
-      ...Object.keys({
-        ...pkg.dependencies,
-        ...pkg.peerDependencies,
-        ...pkg.optionalDependencies,
-      }),
-    );
+    const deps = Object.keys({
+      ...pkg.dependencies,
+      ...pkg.peerDependencies,
+      ...pkg.optionalDependencies,
+    });
+    for (const dep of deps) {
+      queue.push({ name: dep, fromDir: dir });
+    }
   }
   return closure;
 }
@@ -85,14 +102,13 @@ async function copyNutClosure(buildPath: string): Promise<void> {
   // app.asar y su ausencia provoca MODULE_NOT_FOUND (code=1) al cargar nut-js.
   const closure = dependencyClosure(['@nut-tree-fork/nut-js', 'nice-try']);
   console.log(`[forge] packageAfterCopy: copiando clausura nut-js (${closure.length} pkgs) a ${buildPath}`);
-  for (const name of closure) {
-    const src = path.join(ROOT_NODE_MODULES, name);
-    if (!existsSync(src)) {
+  for (const { name, dir } of closure) {
+    if (!dir || !existsSync(dir)) {
       continue;
     }
     const dest = path.join(buildPath, 'node_modules', name);
     mkdirSync(path.dirname(dest), { recursive: true });
-    cpSync(src, dest, { recursive: true, dereference: true });
+    cpSync(dir, dest, { recursive: true, dereference: true });
   }
 }
 
