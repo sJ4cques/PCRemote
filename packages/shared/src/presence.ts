@@ -151,3 +151,34 @@ export async function sendWakeCommand(db: Firestore, senderDevice = "client"): P
     { merge: true },
   );
 }
+
+/**
+ * Escribe la orden de APAGADO que el HOST ejecuta en la PC remota
+ * (`powerOn=false` + timestamp fresco + senderDevice).
+ *
+ * A diferencia del WoL (que va a `pc_commands/desktop` porque la tableta lo
+ * relee para disparar el magic packet), la orden de apagado va al doc del HOST
+ * destino: `pc_commands/{hostId}`. El host escucha ESE doc (y el alias legacy
+ * "desktop", por el teléfono Android) y ejecuta el shutdown del SO solo si el
+ * `timestamp` es reciente (`POWER_OFF_ACCEPT_WINDOW_MS`). Así, si algún día hay
+ * dos PCs, cada host apaga SOLO su máquina.
+ *
+ * La tableta ignora `powerOn=false` (solo reacciona al `true` para WoL), así
+ * que no hay conflicto por compartir colección.
+ */
+export async function sendPowerOffCommand(
+  db: Firestore,
+  hostId: string,
+  senderDevice = "client",
+): Promise<void> {
+  const id = hostId || PC_COMMANDS_DOC_ID;
+  await setDoc(
+    doc(db, PC_COMMANDS_COLLECTION, id),
+    {
+      powerOn: false,
+      timestamp: Date.now(),
+      senderDevice,
+    },
+    { merge: true },
+  );
+}

@@ -76,11 +76,21 @@ export const PRESENCE_MACHINE_ID = "desktop";
 // `pc_commands/{hostId}` y la tablet se emparejaría por host.
 // ---------------------------------------------------------------------------
 
-/** Colección del comando de encendido WoL. */
+/** Colección del comando de encendido/apagado. */
 export const PC_COMMANDS_COLLECTION = "pc_commands";
 
 /** Doc fijo que la tableta escucha (mismo que usa la app Android). */
 export const PC_COMMANDS_DOC_ID = "desktop";
+
+/**
+ * Ventana de frescura de una orden de APAGADO remoto (ms).
+ *
+ * El host ejecuta un shutdown del SO solo si recibe `powerOn=false` con un
+ * `timestamp` dentro de esta ventana. El filtro evita apagar la PC por un
+ * comando viejo que quedó escrito en el doc durante una sesión anterior (por
+ * ejemplo, si el host arranca con el doc ya "sucio").
+ */
+export const POWER_OFF_ACCEPT_WINDOW_MS = 30_000;
 
 /** Tope de probes por ventana. Lo aplica la Cloud Function (`packages/functions`). */
 export const PROBE_RATE_LIMIT_MAX = 10;

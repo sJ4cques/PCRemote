@@ -2,7 +2,7 @@
   "functions": [
     {
       "source": "packages/functions",
-      "codebase": "default",
+      "codebase": "presence",
       "runtime": "nodejs22"
     }
   ],

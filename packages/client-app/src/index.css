@@ -198,6 +198,16 @@ body {
   cursor: none;
 }
 
+/* Modo pan: la mano de arrastre reemplaza el cursor oculto (va DESPUÉS de
+   `.remote-active` para ganar la especificidad). */
+.video-container.panning {
+  cursor: grab;
+}
+
+.video-container.panning:active {
+  cursor: grabbing;
+}
+
 .remote-cursor {
   position: absolute;
   z-index: 6;
@@ -319,6 +329,70 @@ body {
   height: 100%;
   object-fit: contain;
   display: block;
+}
+
+/* Etapa del video: aloja el <video> escalado (zoom/pan). Sin tamaño explícito
+   cubre el contenedor (zoom 1, los mismos letterboxings de siempre); con zoom
+   se le aplican ancho/alto + left/top exactos en línea (base centrada − pan). */
+.remote-stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  contain: layout;
+}
+
+/* Barrita flotante de zoom/pan. El fondo deja pasar los clics al video
+   (`pointer-events: none`); solo los botones reciben el puntero. */
+.vp-bar {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid #2b2f36;
+  border-radius: 7px;
+  background: rgba(17, 19, 24, 0.72);
+  pointer-events: none;
+}
+
+.vp-btn {
+  pointer-events: auto;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #c6c9cf;
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+}
+
+.vp-btn:hover {
+  background: rgba(58, 125, 255, 0.25);
+  color: #fff;
+}
+
+.vp-btn.active {
+  background: rgba(58, 125, 255, 0.32);
+  color: #fff;
+}
+
+.vp-zoom {
+  min-width: 40px;
+  text-align: center;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: #c6c9cf;
+  pointer-events: none;
+  user-select: none;
 }
 
 .no-video {
@@ -529,6 +603,37 @@ body {
   border-color: #f59e0b;
   background: rgba(245, 158, 11, 0.15);
   color: #f59e0b;
+}
+
+.pair-action.off {
+  color: #f2555a;
+}
+
+.pair-action.off:hover {
+  border-color: #dc2626;
+  background: rgba(220, 38, 38, 0.18);
+  color: #f87171;
+}
+
+.pair-action.off.armed {
+  width: auto;
+  padding: 0 0.55rem;
+  font-weight: 600;
+  font-size: 0.72rem;
+  border-color: #dc2626;
+  background: #dc2626;
+  color: #fff;
+}
+
+.pair-action.off-cancel {
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+.pair-action.off-cancel:hover {
+  border-color: #dc2626;
+  background: rgba(220, 38, 38, 0.18);
+  color: #f87171;
 }
 
 .btn.ghost.remove {

@@ -6,6 +6,7 @@ export {
   PRESENCE_MACHINE_ID,
   PC_COMMANDS_COLLECTION,
   PC_COMMANDS_DOC_ID,
+  POWER_OFF_ACCEPT_WINDOW_MS,
   PROBE_RATE_LIMIT_MAX,
   PROBE_RATE_LIMIT_WINDOW_MS,
   PROBE_MAX_AGE_MS,
@@ -22,6 +23,7 @@ export {
   presenceSummary,
   readHostPresence,
   sendWakeCommand,
+  sendPowerOffCommand,
   type HostState,
   type HostPresenceSnapshot,
 } from "./presence";

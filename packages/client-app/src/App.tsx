@@ -11,6 +11,7 @@ import {
   presenceSummary,
   readHostPresence,
   sendWakeCommand,
+  sendPowerOffCommand,
   type DataChannelMessage,
   type HostPresenceSnapshot,
   type MouseAction,
@@ -93,6 +94,8 @@ const App: React.FC = () => {
   const [presences, setPresences] = useState<Record<string, PairPresence>>({});
   /** Feedback del encendido WoL en la vista de sesión (overlay PC Offline). */
   const [sessionWakeMsg, setSessionWakeMsg] = useState('');
+  /** Equipo cuyo botón "Apagar" está armado esperando confirmación (doble toque). */
+  const [armingOffId, setArmingOffId] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState('');
   const [newId, setNewId] = useState('');
@@ -172,6 +175,23 @@ const App: React.FC = () => {
   const audioOnlyRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  /** Viewport remoto (zoom + pan). `zoom>=1`; zoom 1 = pantalla ajustada entera
+   *  (comportamiento actual). `panX/panY` en píxeles del contenedor del video. */
+  const [viewport, setViewport] = useState({ zoom: 1, panX: 0, panY: 0 });
+  const viewportRef = useRef(viewport);
+  /** Tamaño actual del contenedor del video (se recalcula con ResizeObserver). */
+  const [containerSize, setContainerSize] = useState<{ w: number; h: number } | null>(null);
+  /** Remarca un render cuando llega la resolución del host (mensaje `display`). */
+  const [, setDisplayTick] = useState(0);
+  /** Elemento que aloja el video escalado (zoom/pan). */
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  /** Modo pan: mientras está activo, arrastrar mueve el viewport en vez de
+   *  controlar el host. Espejo en ref para usarlo desde handlers estables. */
+  const [panMode, setPanMode] = useState(false);
+  const panModeRef = useRef(false);
+  /** Punto y pan de inicio del arrastre de pan en curso (coord del contenedor). */
+  const panDragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+
   /** Último valor del portapapeles local aplicado (evita ecos al sincronizar). */
   const lastClipboardRef = useRef<string | null>(null);
 
@@ -182,6 +202,36 @@ const App: React.FC = () => {
   useEffect(() => {
     refreshPairs();
   }, [refreshPairs]);
+
+  /** Espejo del viewport en ref (los handlers de entrada lo leen sin re-renders). */
+  useEffect(() => {
+    viewportRef.current = viewport;
+  }, [viewport]);
+
+  /** Espejo del modo pan en ref. */
+  useEffect(() => {
+    panModeRef.current = panMode;
+  }, [panMode]);
+
+  /** Mantiene el tamaño del contenedor del video al día (resize de la ventana,
+   *  pantalla completa, etc.). Corre al entrar a la sesión. */
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) {
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    setContainerSize({ w: rect.width, h: rect.height });
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r) {
+        setContainerSize({ w: r.width, h: r.height });
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
 
   /** Relee `presence/{hostId}` de todos los equipos emparejados. Barato: solo
    *  lecturas, sin tocar la cuota de escritura de Firestore. NUNCA lanza:
@@ -274,6 +324,125 @@ const App: React.FC = () => {
       .catch(() => setSessionWakeMsg('No se pudo escribir en Firestore (¿red?). Reintentá manualmente.'));
   }, []);
 
+  /** Desarma el botón "Apagar" (primer toque) pasado el lapso de confirmación. */
+  const disarmAllBtnRef = useRef<number | null>(null);
+
+  /** Escribe la orden de apagado (`pc_commands/{hostId}` powerOn=false) y
+   *  actualiza el feedback. El HOST es quien ejecuta el shutdown del SO. */
+  const doPowerOff = useCallback(
+    (pairId: string) => {
+      setPresences((prev) => ({
+        ...prev,
+        [pairId]: {
+          ...(prev[pairId] ?? { status: 'checking', label: '' }),
+          wakeNote: 'Enviando orden de apagado…',
+        },
+      }));
+      void sendPowerOffCommand(getFirebaseDb(), pairId, 'client')
+        .then(() => {
+          setPresences((prev) => ({
+            ...prev,
+            [pairId]: {
+              ...(prev[pairId] ?? { status: 'checking', label: '' }),
+              wakeNote: 'Orden de apagado enviada. El host está apagando la PC.',
+            },
+          }));
+          window.setTimeout(() => void refreshPresences(), 8_000);
+          window.setTimeout(() => void refreshPresences(), 20_000);
+          window.setTimeout(() => {
+            setPresences((prev) => {
+              const next = { ...prev };
+              const p = next[pairId];
+              if (p) {
+                next[pairId] = { ...p, wakeNote: undefined };
+              }
+              return next;
+            });
+          }, 20_000);
+        })
+        .catch(() =>
+          setPresences((prev) => ({
+            ...prev,
+            [pairId]: {
+              ...(prev[pairId] ?? { status: 'error', label: '' }),
+              wakeNote: 'No se pudo escribir el comando (¿reglas o red?).',
+            },
+          })),
+        );
+    },
+    [refreshPresences],
+  );
+
+  const stopArmTimer = useCallback(() => {
+    if (disarmAllBtnRef.current !== null) {
+      window.clearTimeout(disarmAllBtnRef.current);
+      disarmAllBtnRef.current = null;
+    }
+  }, []);
+
+  /** Quita la nota "Apagado armado…" de cualquier card (el texto solo se muestra armado). */
+  const clearArmNote = useCallback(() => {
+    setPresences((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of Object.keys(next)) {
+        const p = next[id];
+        if (p?.wakeNote?.startsWith('Apagado armado')) {
+          next[id] = { ...p, wakeNote: undefined };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+
+  /** Cancela un apagado armado (botón ✕ o timeout de 6 s). */
+  const cancelPowerOff = useCallback(() => {
+    stopArmTimer();
+    setArmingOffId(null);
+    clearArmNote();
+  }, [stopArmTimer, clearArmNote]);
+
+  /**
+   * Apagado destructivo. Primer toque: el botón pasa a "¿Apagar?" + ✕ y se
+   * muestra una nota en la card (se desarma solo a los 6 s). Segundo toque en
+   * "¿Apagar?": escribe `pc_commands/{hostId}` con `powerOn=false`; el host es
+   * quien ejecuta el shutdown del SO.
+   */
+  const handlePowerOffClick = useCallback(
+    (pairId: string) => {
+      if (armingOffId === pairId) {
+        stopArmTimer();
+        clearArmNote();
+        setArmingOffId(null);
+        doPowerOff(pairId);
+        return;
+      }
+      stopArmTimer();
+      setArmingOffId(pairId);
+      setPresences((prev) => ({
+        ...prev,
+        [pairId]: {
+          ...(prev[pairId] ?? { status: 'checking', label: '' }),
+          wakeNote: 'Apagado armado: tocá "¿Apagar?" para confirmar (se cancela en 6 s).',
+        },
+      }));
+      disarmAllBtnRef.current = window.setTimeout(() => {
+        disarmAllBtnRef.current = null;
+        setArmingOffId(null);
+        clearArmNote();
+      }, 6_000);
+    },
+    [armingOffId, stopArmTimer, clearArmNote, doPowerOff],
+  );
+
+  useEffect(
+    () => () => {
+      stopArmTimer();
+    },
+    [stopArmTimer],
+  );
+
   const toggleFullscreen = useCallback(() => {
     setFullscreen((prev) => {
       const next = !prev;
@@ -294,53 +463,180 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [toggleFullscreen]);
 
-  /** Convierte un punto del elemento <video> (incluye letterboxing) a la
-   *  posición del escritorio del host según su resolución REAL. */
-  const toHostPoint = useCallback((clientX: number, clientY: number) => {
-    const video = videoRef.current;
-    if (!video) {
-      return null;
-    }
+  /** Resolución REAL del escritorio del host (mensaje `display`); si todavía no
+   *  llegó, cae a la del video (la captura puede llegar escalada, pero sirve
+   *  como aproximación inicial). */
+  const hostSizeNow = useCallback((): { width: number; height: number } | null => {
     const host = hostDisplayRef.current;
-    const hostW = host?.width ?? video.videoWidth;
-    const hostH = host?.height ?? video.videoHeight;
-    if (!hostW || !hostH) {
-      return null;
+    if (host?.width && host?.height) {
+      return host;
     }
-    const rect = video.getBoundingClientRect();
-    const scale = Math.min(rect.width / hostW, rect.height / hostH);
-    const drawW = hostW * scale;
-    const drawH = hostH * scale;
-    const offsetX = (rect.width - drawW) / 2;
-    const offsetY = (rect.height - drawH) / 2;
-    const x = Math.round((clientX - rect.left - offsetX) / scale);
-    const y = Math.round((clientY - rect.top - offsetY) / scale);
-    return {
-      x: Math.min(Math.max(x, 0), hostW - 1),
-      y: Math.min(Math.max(y, 0), hostH - 1),
-    };
+    const v = videoRef.current;
+    if (v && v.videoWidth && v.videoHeight) {
+      return { width: v.videoWidth, height: v.videoHeight };
+    }
+    return null;
   }, []);
 
+  /** Escala "ajustar todo" (fit) para que un escritorio del host entre en un
+   *  contenedor dado (conserva la relación de aspecto, letterboxing incluido). */
+  const fitScaleFor = useCallback(
+    (w: number, h: number, hostW: number, hostH: number): number =>
+      Math.min(w / hostW, h / hostH),
+    [],
+  );
+
+  /** Escala efectiva actual (fit × zoom), posición base centrada (letterboxing)
+   *  y límites de pan según el contenedor. `s`=0 si falta contenedor o host. */
+  const viewportBounds = useCallback(
+    (
+      zoomOverride?: number,
+    ): { s: number; baseLeft: number; baseTop: number; maxPanX: number; maxPanY: number } => {
+      const container = containerRef.current;
+      const host = hostSizeNow();
+      if (!container || !host) {
+        return { s: 0, baseLeft: 0, baseTop: 0, maxPanX: 0, maxPanY: 0 };
+      }
+      const rect = container.getBoundingClientRect();
+      const fit = fitScaleFor(rect.width, rect.height, host.width, host.height);
+      const s = fit * (zoomOverride ?? viewportRef.current.zoom);
+      const sw = host.width * s;
+      const sh = host.height * s;
+      return {
+        s,
+        baseLeft: (rect.width - sw) / 2,
+        baseTop: (rect.height - sh) / 2,
+        maxPanX: Math.max(0, (sw - rect.width) / 2),
+        maxPanY: Math.max(0, (sh - rect.height) / 2),
+      };
+    },
+    [fitScaleFor, hostSizeNow],
+  );
+
+  /** Aplica un viewport nuevo, recortando el zoom (1–8×) y el pan a los límites
+   *  (offset firmado respecto al centro, `±(stage-container)/2`). Con zoom 1 el
+   *  pan no tiene sentido: además desactiva el modo pan. */
+  const applyViewport = useCallback(
+    (next: { zoom: number; panX: number; panY: number }) => {
+      const zoom = Math.max(1, Math.min(8, next.zoom));
+      const bounds = viewportBounds(zoom);
+      const panX = Math.max(-bounds.maxPanX, Math.min(next.panX, bounds.maxPanX));
+      const panY = Math.max(-bounds.maxPanY, Math.min(next.panY, bounds.maxPanY));
+      const value = { zoom, panX, panY };
+      viewportRef.current = value;
+      setViewport(value);
+      if (zoom === 1 && panModeRef.current) {
+        setPanMode(false);
+        panModeRef.current = false;
+      }
+    },
+    [viewportBounds],
+  );
+
+  /** Vuelve a ajustar la pantalla entera (zoom 1, pan 0). */
+  const resetViewport = useCallback(() => {
+    applyViewport({ zoom: 1, panX: 0, panY: 0 });
+  }, [applyViewport]);
+
+  /** Zoom con anclaje: mantiene fijo el punto del escritorio del host que está
+   *  bajo el cursor `(clientX, clientY)` mientras cambia el zoom. */
+  const zoomAtClientPoint = useCallback(
+    (clientX: number, clientY: number, dir: 1 | -1) => {
+      const container = containerRef.current;
+      if (!container) {
+        return;
+      }
+      const rect = container.getBoundingClientRect();
+      const mx = clientX - rect.left;
+      const my = clientY - rect.top;
+      const before = viewportBounds();
+      if (!before.s) {
+        return;
+      }
+      const { zoom, panX, panY } = viewportRef.current;
+      const anchorHostX = (mx - before.baseLeft - panX) / before.s;
+      const anchorHostY = (my - before.baseTop - panY) / before.s;
+      const nextZoom = Math.max(1, Math.min(8, dir === 1 ? zoom * 1.25 : zoom / 1.25));
+      const after = viewportBounds(nextZoom);
+      applyViewport({
+        zoom: nextZoom,
+        panX: mx - after.baseLeft - anchorHostX * after.s,
+        panY: my - after.baseTop - anchorHostY * after.s,
+      });
+    },
+    [applyViewport, viewportBounds],
+  );
+
+  /** Zoom desde el centro del viewport (botones ＋ / − de la barra). */
+  const zoomAtCenter = useCallback(
+    (dir: 1 | -1) => {
+      const container = containerRef.current;
+      if (!container) {
+        return;
+      }
+      const rect = container.getBoundingClientRect();
+      zoomAtClientPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, dir);
+    },
+    [zoomAtClientPoint],
+  );
+
+  /** Activa/desactiva el modo pan. Al activarlo sin zoom, hace zoom desde el
+   *  centro (1.25×) para que el arrastre tenga espacio donde moverse. */
+  const togglePanMode = useCallback(() => {
+    const next = !panModeRef.current;
+    panModeRef.current = next;
+    setPanMode(next);
+    if (next && viewportRef.current.zoom <= 1) {
+      const container = containerRef.current;
+      if (container) {
+        const rect = container.getBoundingClientRect();
+        zoomAtClientPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, 1);
+      }
+    }
+  }, [applyViewport, zoomAtClientPoint]);
+
+  /** Convierte un punto del contenedor del video (incluye zoom/pan) a la
+   *  posición del escritorio del host según su resolución REAL. */
+  const toHostPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const container = containerRef.current;
+      const host = hostSizeNow();
+      if (!container || !host) {
+        return null;
+      }
+      const rect = container.getBoundingClientRect();
+      const bounds = viewportBounds();
+      if (!bounds.s) {
+        return null;
+      }
+      const x = Math.round((clientX - rect.left - bounds.baseLeft - viewportRef.current.panX) / bounds.s);
+      const y = Math.round((clientY - rect.top - bounds.baseTop - viewportRef.current.panY) / bounds.s);
+      return {
+        x: Math.min(Math.max(x, 0), host.width - 1),
+        y: Math.min(Math.max(y, 0), host.height - 1),
+      };
+    },
+    [hostSizeNow, viewportBounds],
+  );
+
   /** Mapea un punto del host al contenedor local (para el overlay del cursor). */
-  const toClientPoint = useCallback((hostX: number, hostY: number) => {
-    const container = containerRef.current;
-    if (!container) {
-      return null;
-    }
-    const host = hostDisplayRef.current;
-    const hostW = host?.width ?? videoRef.current?.videoWidth;
-    const hostH = host?.height ?? videoRef.current?.videoHeight;
-    if (!hostW || !hostH) {
-      return null;
-    }
-    const rect = container.getBoundingClientRect();
-    const scale = Math.min(rect.width / hostW, rect.height / hostH);
-    const drawW = hostW * scale;
-    const drawH = hostH * scale;
-    const left = (rect.width - drawW) / 2 + hostX * scale;
-    const top = (rect.height - drawH) / 2 + hostY * scale;
-    return { left, top };
-  }, []);
+  const toClientPoint = useCallback(
+    (hostX: number, hostY: number) => {
+      const container = containerRef.current;
+      if (!container) {
+        return null;
+      }
+      const bounds = viewportBounds();
+      if (!bounds.s) {
+        return null;
+      }
+      return {
+        left: bounds.baseLeft + viewportRef.current.panX + hostX * bounds.s,
+        top: bounds.baseTop + viewportRef.current.panY + hostY * bounds.s,
+      };
+    },
+    [viewportBounds],
+  );
 
   const send = useCallback((msg: DataChannelMessage): void => {
     peerRef.current?.send(msg);
@@ -367,6 +663,22 @@ const App: React.FC = () => {
 
   const handleMouseMove = useCallback(
     (e: React.PointerEvent<HTMLVideoElement>) => {
+      const drag = panDragRef.current;
+      if (drag) {
+        // Modo pan: el arrastre mueve el viewport, no envía nada al host.
+        e.preventDefault();
+        const dx = e.clientX - drag.x;
+        const dy = e.clientY - drag.y;
+        applyViewport({
+          zoom: viewportRef.current.zoom,
+          panX: drag.panX + dx,
+          panY: drag.panY + dy,
+        });
+        return;
+      }
+      if (panModeRef.current) {
+        return;
+      }
       const p = toHostPoint(e.clientX, e.clientY);
       if (!p) {
         return;
@@ -386,12 +698,28 @@ const App: React.FC = () => {
         }, 25);
       }
     },
-    [sendMouse, toHostPoint],
+    [applyViewport, sendMouse, toHostPoint],
   );
 
   const handleMouseDown = useCallback(
     (e: React.PointerEvent<HTMLVideoElement>) => {
       e.preventDefault();
+      if (panModeRef.current) {
+        // Modo pan: empezar el arrastre reteniendo el punto inicial del pan.
+        panDragRef.current = {
+          x: e.clientX,
+          y: e.clientY,
+          panX: viewportRef.current.panX,
+          panY: viewportRef.current.panY,
+        };
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          // Algunos WebViews no permiten capturar el puntero después de un menú.
+        }
+        e.currentTarget.focus();
+        return;
+      }
       const p = toHostPoint(e.clientX, e.clientY);
       if (!p) {
         return;
@@ -424,6 +752,10 @@ const App: React.FC = () => {
   const handleMouseUp = useCallback(
     (e: React.PointerEvent<HTMLVideoElement>) => {
       e.preventDefault();
+      if (panDragRef.current) {
+        panDragRef.current = null;
+        return;
+      }
       const button = toMouseButton(e.button);
       const p = toHostPoint(e.clientX, e.clientY);
       lastLocalMouseAtRef.current = Date.now();
@@ -454,6 +786,7 @@ const App: React.FC = () => {
       moveTimerRef.current = undefined;
     }
     pendingPointRef.current = null;
+    panDragRef.current = null;
     const pressed = pressedMouseRef.current;
     if (pressed.size === 0) {
       return;
@@ -504,6 +837,12 @@ const App: React.FC = () => {
   const handleWheel = useCallback(
     (e: React.WheelEvent<HTMLVideoElement>) => {
       e.preventDefault();
+      // Ctrl+wheel (y el pinch del trackpad en macOS llega como un wheel con
+      // ctrlKey=true) hace zoom local con anclaje bajo el cursor.
+      if (e.ctrlKey || e.metaKey) {
+        zoomAtClientPoint(e.clientX, e.clientY, e.deltaY < 0 ? 1 : -1);
+        return;
+      }
       wheelAccumRef.current.dx += e.deltaX;
       wheelAccumRef.current.dy += e.deltaY;
       if (wheelTimerRef.current === undefined) {
@@ -517,7 +856,7 @@ const App: React.FC = () => {
         }, 80);
       }
     },
-    [sendMouse],
+    [sendMouse, zoomAtClientPoint],
   );
 
   const handleContextMenu = useCallback((e: React.MouseEvent<HTMLVideoElement>) => {
@@ -757,6 +1096,8 @@ const App: React.FC = () => {
       }
       setSessionName(pairName ?? c);
       setView('session');
+      // Nueva sesión: volver a empezar con la pantalla ajustada (zoom 1, pan 0).
+      resetViewport();
       audioOnlyRef.current = Boolean(audioOnly ?? audioOnlyRef.current);
       setAudioOnlySession(audioOnlyRef.current);
       if (audioOnlyRef.current) {
@@ -890,6 +1231,9 @@ const App: React.FC = () => {
             } else if (msg.kind === 'display') {
               hostDisplayRef.current = { width: msg.payload.width, height: msg.payload.height };
               console.log(`[client] display_info ${msg.payload.width}x${msg.payload.height}`);
+              // Refresca el render para que la etapa adopte la resolución REAL
+              // del escritorio del host (menos pixel-perfect que el video).
+              setDisplayTick((t) => t + 1);
             } else if (msg.kind === 'cursor') {
               setRemoteCursor({ x: msg.payload.x, y: msg.payload.y });
               cursorLogCountRef.current += 1;
@@ -980,8 +1324,22 @@ const App: React.FC = () => {
     (status === 'ended' || status === 'error') && everConnectedRef.current;
 
   const remoteActive = remoteStream && status === 'connected' && hovering;
-  const cursorBox = remoteActive && remoteCursor ? toClientPoint(remoteCursor.x, remoteCursor.y) : null;
+  // En modo pan el cursor del host queda estático y solo se ve la "mano" de
+  // arrastre: ocultamos el overlay mientras dura el modo.
+  const cursorBox = remoteActive && !panMode && remoteCursor ? toClientPoint(remoteCursor.x, remoteCursor.y) : null;
   const remoteHasAudio = Boolean(remoteStream?.getAudioTracks().length);
+
+  // Etapa del video: tamaño igual a la pantalla del host escalada (fit × zoom),
+// posicionada centrada (letterboxing de siempre) y desplazada por el pan.
+  const stageHost = remoteStream ? hostSizeNow() : null;
+  const stageFit =
+    stageHost && containerSize
+      ? Math.min(containerSize.w / stageHost.width, containerSize.h / stageHost.height)
+      : 0;
+  const stageW = stageHost ? stageHost.width * stageFit * viewport.zoom : 0;
+  const stageH = stageHost ? stageHost.height * stageFit * viewport.zoom : 0;
+  const stageLeft = (containerSize?.w ?? 0) / 2 - stageW / 2;
+  const stageTop = (containerSize?.h ?? 0) / 2 - stageH / 2;
 
   const handleConnectPair = useCallback(
     (pair: SavedPair) => {
@@ -1211,6 +1569,48 @@ const App: React.FC = () => {
                   <path d="M13 2 4 14h6l-1 8L18 9h-6z" />
                 </svg>
               </button>
+              {presences[pair.id]?.status === 'on' &&
+                (armingOffId === pair.id ? (
+                  <>
+                    <button
+                      type="button"
+                      className="pair-action off armed"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handlePowerOffClick(pair.id);
+                      }}
+                      title="Confirmar el apagado de esta PC"
+                    >
+                      ¿Apagar?
+                    </button>
+                    <button
+                      type="button"
+                      className="pair-action off-cancel"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        cancelPowerOff();
+                      }}
+                      title="Cancelar el apagado"
+                    >
+                      ✕
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="pair-action off"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handlePowerOffClick(pair.id);
+                    }}
+                    title="Apagar esta PC (solo se muestra si está encendida)"
+                  >
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+                      <path d="M12 3v8" />
+                      <path d="M6.2 6.8a8 8 0 1 0 11.6 0" />
+                    </svg>
+                  </button>
+                ))}
               <button
                 type="button"
                 className="pair-action play"
@@ -1359,7 +1759,7 @@ const App: React.FC = () => {
       ) : (
         <div
           ref={containerRef}
-          className={`video-container ${remoteActive ? 'remote-active' : ''}`}
+          className={`video-container ${remoteActive ? 'remote-active' : ''}${panMode ? ' panning' : ''}`}
           onMouseEnter={() => setHovering(true)}
           onMouseLeave={() => {
             setHovering(false);
@@ -1368,26 +1768,41 @@ const App: React.FC = () => {
           }}
         >
           {remoteStream ? (
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              className="remote-video"
-              tabIndex={-1}
-              onPointerMove={handleMouseMove}
-              onPointerDown={handleMouseDown}
-              onPointerUp={handleMouseUp}
-              onPointerCancel={handlePointerCancel}
-              onWheel={handleWheel}
-              onContextMenu={handleContextMenu}
-              onLoadedMetadata={(e) => {
-                const v = e.currentTarget;
-                const track = (v.srcObject as MediaStream | null)?.getVideoTracks()[0];
-                console.log(
-                  `[client] video_ready w=${v.videoWidth} h=${v.videoHeight} srcW=${track?.getSettings().width ?? '?'}`,
-                );
-              }}
-            />
+            <div
+              ref={stageRef}
+              className="remote-stage"
+              style={
+                stageW > 0 && stageH > 0 && containerSize
+                  ? {
+                      width: stageW,
+                      height: stageH,
+                      left: stageLeft + viewport.panX,
+                      top: stageTop + viewport.panY,
+                    }
+                  : undefined
+              }
+            >
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                className="remote-video"
+                tabIndex={-1}
+                onPointerMove={handleMouseMove}
+                onPointerDown={handleMouseDown}
+                onPointerUp={handleMouseUp}
+                onPointerCancel={handlePointerCancel}
+                onWheel={handleWheel}
+                onContextMenu={handleContextMenu}
+                onLoadedMetadata={(e) => {
+                  const v = e.currentTarget;
+                  const track = (v.srcObject as MediaStream | null)?.getVideoTracks()[0];
+                  console.log(
+                    `[client] video_ready w=${v.videoWidth} h=${v.videoHeight} srcW=${track?.getSettings().width ?? '?'}`,
+                  );
+                }}
+              />
+            </div>
           ) : (
             <div className="no-video">
               {status === 'connected'
@@ -1423,6 +1838,30 @@ const App: React.FC = () => {
             >
               {fullscreen ? '⤢ Salir' : '⤢ Pantalla completa'}
             </button>
+          )}
+
+          {remoteStream && (
+            <div className="vp-bar" role="group" aria-label="Zoom y pan">
+              <button
+                type="button"
+                className={`vp-btn${panMode ? ' active' : ''}`}
+                onClick={togglePanMode}
+                aria-pressed={panMode}
+                title={panMode ? 'Salir del modo pan' : 'Modo pan: arrastra para moverte por la pantalla'}
+              >
+                🖐
+              </button>
+              <button type="button" className="vp-btn" onClick={() => zoomAtCenter(-1)} title="Alejar">
+                −
+              </button>
+              <span className="vp-zoom">{Math.round(viewport.zoom * 100)}%</span>
+              <button type="button" className="vp-btn" onClick={() => zoomAtCenter(1)} title="Acercar">
+                +
+              </button>
+              <button type="button" className="vp-btn" onClick={resetViewport} title="Ajustar toda la pantalla">
+                Ajustar
+              </button>
+            </div>
           )}
 
           {lostOverlay}
