@@ -142,3 +142,35 @@ export const PRESENCE_STALE_AFTER_MS = 10 * 60 * 1000;
  *  el dato pasivo (sin tocar la cuota). Lo eligen las apps Android según su
  *  modo (teléfono vs tablet con foreground service). */
 export const PRESENCE_PASSIVE_POLL_MS = 30 * 1000;
+
+// ---------------------------------------------------------------------------
+// Cámara de la tablet (cliente de escritorio → tablet Android)
+//
+// El cliente de escritorio pide la cámara de la tablet y recibe el vídeo por
+// WebRTC. La señalización es un espejo del protocolo de `sessions`: el cliente
+// ofrece (`recvonly` de vídeo) y la tablet responde con su cámara. La identidad
+// se reutiliza del emparejamiento host (`hostId` + `secret`): el cliente escribe
+// `token = sha256(secret)` y la tablet lo valida.
+//
+// Layout:
+//   tablet_commands/{hostId}   cameraStream + mode + timestamp + token (cliente)
+//   tablet_stream/{hostId}     offer/answer + status + tokenHash
+//     ├─ clientCandidates      candidatos ICE del cliente
+//     └─ hostCandidates        candidatos ICE de la tablet (nombre legacy)
+// ---------------------------------------------------------------------------
+
+/** Colección del comando de cámara que la tablet escucha. */
+export const TABLET_COMMANDS_COLLECTION = "tablet_commands";
+
+/** Colección de señalización del streaming de cámara de la tablet. */
+export const TABLET_STREAM_COLLECTION = "tablet_stream";
+
+/**
+ * Ventana de frescura de una orden de cámara (ms).
+ *
+ * La tablet ignora un `cameraStream=true` con `timestamp` más viejo que esto:
+ * si el usuario abre el Modo Tablet mucho después de que el cliente pidiera la
+ * cámara, no queremos encenderla sola. El cliente repite el comando mientras
+ * su vista sigue esperando.
+ */
+export const TABLET_CMD_FRESH_MS = 60 * 1000;

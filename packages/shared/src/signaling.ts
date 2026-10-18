@@ -743,6 +743,13 @@ export interface ClientPeerOptions extends PeerHandlers {
   db: Firestore;
   code: string;
   deviceName: string;
+  /**
+   * Colección de Firestore donde vive el doc de señalización. Default
+   * `FIRESTORE_COLLECTION` (`sessions`). Se usa `TABLET_STREAM_COLLECTION`
+   * (`tablet_stream`) para recibir la cámara de la tablet, reutilizando el
+   * mismo protocolo offer/answer/candidatos.
+   */
+  collection?: string;
   /** PIN enviado por el usuario (vacío si la sesión no lo exige). */
   pin?: string;
   /**
@@ -759,6 +766,12 @@ export interface ClientPeerOptions extends PeerHandlers {
    * (el oferente no crea la sección `m=video` y el host responde con solo audio).
    */
   audioOnly?: boolean;
+  /**
+   * Pide una sección `m=audio` (default `true`). En `false` la negociación SDP
+   * no lleva audio: se usa para el streaming de cámara de la tablet, que es
+   * solo vídeo. No tiene efecto si `audioOnly` es `true`.
+   */
+  audio?: boolean;
   /** Se invoca al recibir el primer track remoto con el stream de video. */
   onRemoteStream?: (stream: MediaStream) => void;
 }
@@ -777,6 +790,8 @@ export class ClientPeer {
   private readonly connectionTimeoutMs: number;
   private readonly iceServers: RTCIceServer[];
   private readonly audioOnly: boolean;
+  private readonly wantAudio: boolean;
+  private readonly collectionName: string;
   private readonly onStatus: (status: PeerStatus, detail?: string) => void;
   private readonly onData?: (msg: DataChannelMessage) => void;
   private readonly onChannelState?: (open: boolean) => void;
@@ -812,11 +827,13 @@ export class ClientPeer {
     this.connectionTimeoutMs = options.connectionTimeoutMs ?? 90 * 1000;
     this.iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS;
     this.audioOnly = options.audioOnly === true;
+    this.wantAudio = options.audio !== false;
+    this.collectionName = options.collection ?? FIRESTORE_COLLECTION;
     this.onStatus = options.onStatus;
     this.onData = options.onData;
     this.onChannelState = options.onChannelState;
     this.onRemoteStream = options.onRemoteStream;
-    this.sessionRef = doc(collection(this.db, FIRESTORE_COLLECTION), this.code);
+    this.sessionRef = doc(collection(this.db, this.collectionName), this.code);
   }
 
   async start(): Promise<ClientPeerStartResult> {
@@ -870,8 +887,10 @@ export class ClientPeer {
     // `m=video` y el host responde capturando únicamente audio (loopback).
     if (!this.audioOnly) {
       this.pc.addTransceiver("video", { direction: "recvonly" });
+      if (this.wantAudio) {
+        this.pc.addTransceiver("audio", { direction: "recvonly" });
+      }
     }
-    this.pc.addTransceiver("audio", { direction: "recvonly" });
     this.pc.ontrack = (ev) => {
       if (ev.streams.length > 0 && ev.streams[0]) {
         this.remoteStream = ev.streams[0];
@@ -889,7 +908,7 @@ export class ClientPeer {
 
     this.unsubCandidates = onSnapshot(
       query(
-        collection(this.db, FIRESTORE_COLLECTION, this.code, "hostCandidates"),
+        collection(this.db, this.collectionName, this.code, "hostCandidates"),
         orderBy("at", "asc"),
       ),
       (s) => this.handleCandidates(s),
@@ -1071,7 +1090,7 @@ export class ClientPeer {
   private async pushCandidate(candidate: RTCIceCandidate): Promise<void> {
     try {
       await addDoc(
-        collection(this.db, FIRESTORE_COLLECTION, this.code, "clientCandidates"),
+        collection(this.db, this.collectionName, this.code, "clientCandidates"),
         {
           sdpMid: candidate.sdpMid,
           sdpMLineIndex: candidate.sdpMLineIndex,

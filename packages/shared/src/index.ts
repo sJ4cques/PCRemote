@@ -14,6 +14,9 @@ export {
   PRESENCE_HEARTBEAT_MS,
   PRESENCE_STALE_AFTER_MS,
   PRESENCE_PASSIVE_POLL_MS,
+  TABLET_COMMANDS_COLLECTION,
+  TABLET_STREAM_COLLECTION,
+  TABLET_CMD_FRESH_MS,
   type FirebaseConfig,
 } from "./config";
 export {
@@ -67,3 +70,11 @@ export {
   encodeDataChannelMessage,
   decodeDataChannelMessage,
 } from "./control";
+export {
+  requestTabletCamera,
+  stopTabletCamera,
+  readTabletStreamState,
+  isTabletCommandFresh,
+  type TabletCameraMode,
+  type TabletStreamState,
+} from "./tablet";

@@ -64,6 +64,26 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // Cámara de la tablet (cliente de escritorio → tablet Android).
+    // El cliente (SDK web anónimo) escribe el comando y la oferta WebRTC; la
+    // tablet Android usa su cuenta de servicio (salta estas reglas) para leer el
+    // comando y responder. La identidad se prueba con `token = sha256(secret)`
+    // del emparejamiento, igual que en `sessions`. Mismo modelo de confianza
+    // abierto que `presence`/`pc_commands`.
+    // ATENCIÓN: si el archivo no coincide con la consola, desplegar SOLO
+    // estas reglas (`firebase deploy --only firestore:rules`).
+    match /tablet_commands/{hostId} {
+      allow read, write: if true;
+    }
+
+    match /tablet_stream/{hostId} {
+      allow read, write: if true;
+
+      match /{document=**} {
+        allow read, write: if true;
+      }
+    }
+
     // Verificación de conectividad usada por `pingFirestore()`.
     match /_healthcheck/{doc} {
       allow read, write: if true;
