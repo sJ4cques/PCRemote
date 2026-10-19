@@ -190,7 +190,6 @@ const App: React.FC = () => {
   const [tabletStatus, setTabletStatus] = useState<PeerStatus>('idle');
   const [tabletStatusDetail, setTabletStatusDetail] = useState('');
   const tabletPeerRef = useRef<ClientPeer | null>(null);
-  const tabletVideoRef = useRef<HTMLVideoElement | null>(null);
   /** Repite el comando a la tablet hasta que la conexión arranca. */
   const tabletCmdTimerRef = useRef<number | null>(null);
   /** Id del equipo cuya cámara está activa (para el UX de la card). */
@@ -199,6 +198,19 @@ const App: React.FC = () => {
   const tabletActivePairIdRef = useRef<string | null>(null);
   /** Generación de intento: los callbacks de un peer viejo se ignoran. */
   const tabletGenerationRef = useRef(0);
+  /** Stream actual de la tablet, para alimentar el relay a la ventana separada. */
+  const tabletStreamRef = useRef<MediaStream | null>(null);
+  /** PeerConnection del relay hacia la ventana separada (somos el oferente). */
+  const relayPcRef = useRef<RTCPeerConnection | null>(null);
+  const relayPendingRef = useRef<RTCIceCandidateInit[]>([]);
+  /** Evita reabrir la ventana separada más de una vez por sesión de cámara. */
+  const tabletAutoOpenedRef = useRef(false);
+  /** Par/modo actuales, para que la ventana separada pida cambiar/cerrar. */
+  const tabletCamRef = useRef<{ pair: SavedPair; mode: TabletCameraMode } | null>(null);
+  /** Referencia estable a `startTabletCamera` para la señalización por IPC. */
+  const startTabletCameraRef = useRef<
+    (pair: SavedPair, mode: TabletCameraMode, autoOpen?: boolean) => void
+  >(() => undefined);
 
   /** Viewport remoto (zoom + pan). `zoom>=1`; zoom 1 = pantalla ajustada entera
    *  (comportamiento actual). `panX/panY` en píxeles del contenedor del video. */
@@ -349,8 +361,11 @@ const App: React.FC = () => {
       .catch(() => setSessionWakeMsg('No se pudo escribir en Firestore (¿red?). Reintentá manualmente.'));
   }, []);
 
-  /** Detiene el streaming de cámara y cierra el overlay. */
+  /** Detiene el streaming de cámara y cierra la ventana separada. */
   const closeTabletCamera = useCallback(() => {
+    void window.isis?.closeCameraWindow();
+    relayPcRef.current?.close();
+    relayPcRef.current = null;
     if (tabletCmdTimerRef.current !== null) {
       window.clearInterval(tabletCmdTimerRef.current);
       tabletCmdTimerRef.current = null;
@@ -370,6 +385,74 @@ const App: React.FC = () => {
     setTabletActivePairId(null);
   }, []);
 
+  /** Señalización del relay con la ventana separada (IPC, vía proceso main). */
+  const handleCameraSignal = useCallback(async (data: unknown) => {
+    const msg = data as { type?: string; sdp?: string; candidate?: RTCIceCandidateInit };
+    if (!msg?.type) {
+      return;
+    }
+    if (msg.type === 'switchCamera') {
+      const current = tabletCamRef.current;
+      if (current) {
+        startTabletCameraRef.current(
+          current.pair,
+          current.mode === 'front' ? 'back' : 'front',
+          false,
+        );
+      }
+      return;
+    }
+    if (msg.type === 'closeCamera') {
+      closeTabletCamera();
+      return;
+    }
+    if (msg.type === 'ready') {
+      const stream = tabletStreamRef.current;
+      if (!stream) {
+        return;
+      }
+      relayPcRef.current?.close();
+      const pc = new RTCPeerConnection();
+      relayPcRef.current = pc;
+      relayPendingRef.current = [];
+      for (const track of stream.getTracks()) {
+        pc.addTrack(track, stream);
+      }
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          window.isis?.cameraSend({ type: 'ice', candidate: ev.candidate.toJSON() });
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      window.isis?.cameraSend({ type: 'offer', sdp: offer.sdp });
+    } else if (msg.type === 'answer' && relayPcRef.current) {
+      await relayPcRef.current.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+      for (const candidate of relayPendingRef.current) {
+        try {
+          await relayPcRef.current.addIceCandidate(candidate);
+        } catch {
+          // candidato obsoleto: se ignora
+        }
+      }
+      relayPendingRef.current = [];
+    } else if (msg.type === 'ice' && msg.candidate) {
+      const pc = relayPcRef.current;
+      if (!pc) {
+        return;
+      }
+      if (pc.remoteDescription) {
+        try {
+          await pc.addIceCandidate(msg.candidate);
+        } catch {
+          // candidato obsoleto: se ignora
+        }
+      } else {
+        relayPendingRef.current.push(msg.candidate);
+      }
+    }
+  }, []);
+
   /**
    * Pide la cámara de la tablet emparejada y muestra su streaming.
    *
@@ -382,19 +465,23 @@ const App: React.FC = () => {
    *     anterior, que la tablet limpia al arrancar);
    *  3. negocia WebRTC como oferente `recvonly` de vídeo.
    */
-  const startTabletCamera = useCallback((pair: SavedPair, mode: TabletCameraMode = 'back') => {
-    if (tabletCmdTimerRef.current !== null) {
-      window.clearInterval(tabletCmdTimerRef.current);
-      tabletCmdTimerRef.current = null;
-    }
-    void tabletPeerRef.current?.stop();
-    tabletPeerRef.current = null;
-    setTabletStream(null);
-    tabletGenerationRef.current += 1;
-    const generation = tabletGenerationRef.current;
-    const stale = (): boolean => tabletGenerationRef.current !== generation;
+  const startTabletCamera = useCallback(
+    (pair: SavedPair, mode: TabletCameraMode = 'back', autoOpen = true) => {
+      if (tabletCmdTimerRef.current !== null) {
+        window.clearInterval(tabletCmdTimerRef.current);
+        tabletCmdTimerRef.current = null;
+      }
+      void tabletPeerRef.current?.stop();
+      tabletPeerRef.current = null;
+      setTabletStream(null);
+      tabletGenerationRef.current += 1;
+      const generation = tabletGenerationRef.current;
+      const stale = (): boolean => tabletGenerationRef.current !== generation;
 
-    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      // Si `autoOpen` es false (p. ej. cambiar de cámara), NO se abre la ventana
+      // separada: se respeta lo que el usuario ya eligió.
+      tabletAutoOpenedRef.current = !autoOpen;
+      const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     tabletActivePairIdRef.current = pair.id;
     setTabletActivePairId(pair.id);
     setTabletCam({ pair, mode });
@@ -464,7 +551,14 @@ const App: React.FC = () => {
           if (stale()) {
             return;
           }
+          tabletStreamRef.current = stream;
           setTabletStream(stream);
+          // La cámara SIEMPRE se ve en la ventana separada: se abre al llegar
+          // el primer stream de la sesión.
+          if (!tabletAutoOpenedRef.current) {
+            tabletAutoOpenedRef.current = true;
+            void window.isis?.openCameraWindow();
+          }
         },
       });
       tabletPeerRef.current = peer;
@@ -503,19 +597,43 @@ const App: React.FC = () => {
     })();
   }, []);
 
-  /** Enlaza el stream remoto de la tablet al <video> del overlay. */
+  /** Mantiene el ref del stream actual y reemplaza el track del relay si cambió
+   *  (p. ej. al cambiar de cámara con la ventana separada abierta). */
   useEffect(() => {
-    const v = tabletVideoRef.current;
-    if (!v) {
-      return;
+    tabletStreamRef.current = tabletStream;
+    const pc = relayPcRef.current;
+    if (pc && tabletStream) {
+      const track = tabletStream.getVideoTracks()[0];
+      const sender = pc.getSenders().find((s) => s.track?.kind === 'video') ?? pc.getSenders()[0];
+      if (sender && track) {
+        void sender.replaceTrack(track).catch(() => undefined);
+      }
     }
-    if (tabletStream) {
-      v.srcObject = tabletStream;
-      void v.play().catch(() => undefined);
-    } else {
-      v.srcObject = null;
-    }
-  }, [tabletStream, tabletCam]);
+  }, [tabletStream]);
+
+  /** Refleja el par/modo actuales, que la ventana separada necesita para
+   *  pedir cambiar de cámara. */
+  useEffect(() => {
+    tabletCamRef.current = tabletCam;
+  }, [tabletCam]);
+
+  /** Referencia estable a `startTabletCamera` para la señalización por IPC. */
+  useEffect(() => {
+    startTabletCameraRef.current = startTabletCamera;
+  }, [startTabletCamera]);
+
+  /** Escucha la señalización del relay y el cierre de la ventana separada. */
+  useEffect(() => {
+    const offSignal = window.isis?.onCameraSignal((data) => void handleCameraSignal(data));
+    const offClosed = window.isis?.onCameraWindowClosed(() => {
+      // Cerrar la ventana separada termina la sesión de cámara.
+      closeTabletCamera();
+    });
+    return () => {
+      offSignal?.();
+      offClosed?.();
+    };
+  }, [handleCameraSignal, closeTabletCamera]);
 
   /** Al desmontar, suelta el peer y el timer de la cámara de la tablet. */
   useEffect(() => {
@@ -2098,51 +2216,7 @@ const App: React.FC = () => {
     </div>
   );
 
-  const tabletCameraOverlay = tabletCam ? (
-    <div className="tablet-cam-overlay" role="dialog" aria-modal="true" aria-label="Cámara de la tablet">
-      <div className="tablet-cam-panel">
-        <header className="tablet-cam-bar">
-          <span className="tablet-cam-title">
-            📷 {tabletCam.pair.name} · {tabletCam.mode === 'front' ? 'frontal' : 'trasera'}
-          </span>
-          <span className={`pill ${tabletStatus}`}>
-            {STATUS_TOOLTIP[tabletStatus]}
-            {tabletStatusDetail && ` — ${tabletStatusDetail}`}
-          </span>
-          <button
-            type="button"
-            className="btn"
-            onClick={() =>
-              startTabletCamera(tabletCam.pair, tabletCam.mode === 'front' ? 'back' : 'front')
-            }
-            title="Cambiar entre cámara frontal y trasera"
-          >
-            🔄 Cambiar cámara
-          </button>
-          <button type="button" className="btn primary" onClick={closeTabletCamera}>
-            Cerrar
-          </button>
-        </header>
-        <div className="tablet-cam-stage">
-          <video ref={tabletVideoRef} autoPlay playsInline muted className="tablet-cam-video" />
-          {!tabletStream && (
-            <div className="no-video">
-              {tabletStatus === 'connected'
-                ? 'Sin señal de video'
-                : 'El video de la cámara de la tablet aparecerá aquí. Recordá dejar la app de la tablet abierta en Modo Tablet.'}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  ) : null;
-
-  return (
-    <>
-      {view === 'session' ? session : dashboard}
-      {tabletCameraOverlay}
-    </>
-  );
+  return view === 'session' ? session : dashboard;
 };
 
 export default App;

@@ -11,6 +11,7 @@ const isisArgs: {
   autostop?: number;
   pair?: { id: string; secret: string };
   audioOnly?: boolean;
+  cameraWindow?: boolean;
 } = {};
 
 for (const arg of process.argv) {
@@ -24,6 +25,8 @@ for (const arg of process.argv) {
     isisArgs.clipboardTest = true;
   } else if (arg === '--isis-audio-only') {
     isisArgs.audioOnly = true;
+  } else if (arg === '--isis-camera-window') {
+    isisArgs.cameraWindow = true;
   } else if (arg.startsWith('--isis-autostop=')) {
     const value = Number(arg.slice('--isis-autostop='.length));
     if (Number.isFinite(value) && value > 0) {
@@ -62,6 +65,32 @@ contextBridge.exposeInMainWorld('isis', {
   /** Elimina un equipo emparejado. Devuelve la lista. */
   removePair: (id: string): Promise<SavedPair[]> =>
     ipcRenderer.invoke('isis:pairs-remove', id) as Promise<SavedPair[]>,
+  /** Abre (o enfoca) la ventana separada de la cámara de la tablet. */
+  openCameraWindow: (): Promise<void> =>
+    ipcRenderer.invoke('isis:camera-window-open') as Promise<void>,
+  /** Cierra la ventana separada de la cámara de la tablet. */
+  closeCameraWindow: (): Promise<void> =>
+    ipcRenderer.invoke('isis:camera-window-close') as Promise<void>,
+  /** Envía una señal de relay WebRTC a la otra ventana (main <-> cámara). */
+  cameraSend: (data: unknown): void => {
+    ipcRenderer.send('isis:camera-signal', data);
+  },
+  /** Recibe señales de relay WebRTC. Devuelve la función para desuscribirse. */
+  onCameraSignal: (cb: (data: unknown) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, data: unknown): void => cb(data);
+    ipcRenderer.on('isis:camera-signal', listener);
+    return () => {
+      ipcRenderer.removeListener('isis:camera-signal', listener);
+    };
+  },
+  /** Avisa cuando se cerró la ventana separada de la cámara. */
+  onCameraWindowClosed: (cb: () => void): (() => void) => {
+    const listener = (): void => cb();
+    ipcRenderer.on('isis:camera-window-closed', listener);
+    return () => {
+      ipcRenderer.removeListener('isis:camera-window-closed', listener);
+    };
+  },
 });
 
 export {};

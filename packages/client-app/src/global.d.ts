@@ -32,6 +32,18 @@ declare global {
       setFullscreen: (full: boolean) => void;
       /** Activa/desactiva el modo tapa cerrada (solo macOS, sesión "solo bocina"). */
       setLidMode: (enabled: boolean) => void;
+      /** `true` si este renderer es la ventana separada de la cámara de la tablet. */
+      cameraWindow?: boolean;
+      /** Abre (o enfoca) la ventana separada de la cámara de la tablet. */
+      openCameraWindow: () => Promise<void>;
+      /** Cierra la ventana separada de la cámara. */
+      closeCameraWindow: () => Promise<void>;
+      /** Envía una señal de relay WebRTC a la otra ventana (main <-> cámara). */
+      cameraSend: (data: unknown) => void;
+      /** Recibe señales de relay WebRTC. Devuelve una función para desuscribirse. */
+      onCameraSignal: (cb: (data: unknown) => void) => () => void;
+      /** Avisa cuando se cerró la ventana separada de la cámara. */
+      onCameraWindowClosed: (cb: () => void) => () => void;
       /** Devuelve la lista de equipos emparejados guardados. */
       getPairs: () => Promise<SavedPair[]>;
       /** Guarda/actualiza un equipo emparejado. Devuelve la lista. */

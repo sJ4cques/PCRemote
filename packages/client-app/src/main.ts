@@ -3,6 +3,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFile, execFileSync } from 'node:child_process';
 
+/** Ventana principal de la app. */
+let mainWindow: BrowserWindow | null = null;
+/** Ventana separada de la cámara de la tablet (movible fuera de la app). */
+let cameraWindow: BrowserWindow | null = null;
+
 // Permitir reproducir srcObject sin gesto del usuario (audífonos del control remoto).
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
@@ -218,8 +223,8 @@ ipcMain.handle('isis:clipboard-write', (_event, text: unknown) => {
 });
 
 ipcMain.on('isis:set-fullscreen', (_event, full: unknown) => {
-  const win = BrowserWindow.getAllWindows()[0];
-  if (win) {
+  const win = mainWindow;
+  if (win && !win.isDestroyed()) {
     win.setFullScreen(Boolean(full));
   }
 });
@@ -239,8 +244,72 @@ const isisAutostop = argValue('--isis-autostop');
 // Pruebas: --isis-pair=<hostId>,<secret> conecta directo a un host emparejado.
 const isisPairArgs = argValue('--isis-pair');
 
+// ---------------------------------------------------------------------------
+// Ventana separada de la cámara de la tablet.
+//
+// El <video> con el MediaStream de la tablet vive en la ventana principal; no
+// se puede mover un MediaStream entre procesos. Para mostrarlo en una ventana
+// propia (movible fuera de la app) se hace un relay WebRTC loopback: la ventana
+// principal y la ventana de cámara se conectan entre sí y la señalización viaja
+// por IPC (el proceso main solo reenvía mensajes).
+// ---------------------------------------------------------------------------
+
+function createCameraWindow(): void {
+  if (cameraWindow && !cameraWindow.isDestroyed()) {
+    cameraWindow.show();
+    cameraWindow.focus();
+    return;
+  }
+  cameraWindow = new BrowserWindow({
+    width: 300,
+    height: 540,
+    minWidth: 160,
+    minHeight: 280,
+    frame: false,
+    resizable: true,
+    alwaysOnTop: true,
+    backgroundColor: '#0b0d11',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ['--isis-camera-window'],
+    },
+  });
+  cameraWindow.setAlwaysOnTop(true, 'floating');
+  cameraWindow.on('closed', () => {
+    cameraWindow = null;
+    mainWindow?.webContents.send('isis:camera-window-closed');
+  });
+  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+    void cameraWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}#camera-window`);
+  } else {
+    void cameraWindow.loadFile(
+      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
+      { hash: 'camera-window' },
+    );
+  }
+}
+
+ipcMain.handle('isis:camera-window-open', () => {
+  createCameraWindow();
+});
+
+ipcMain.handle('isis:camera-window-close', () => {
+  cameraWindow?.close();
+});
+
+/** Reenvía una señal de relay de una ventana a la otra (main <-> cámara). */
+ipcMain.on('isis:camera-signal', (event, payload: unknown) => {
+  const sender = BrowserWindow.fromWebContents(event.sender);
+  const target = sender === cameraWindow ? mainWindow : cameraWindow;
+  if (target && !target.isDestroyed()) {
+    target.webContents.send('isis:camera-signal', payload);
+  }
+});
+
 const createWindow = (): void => {
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
     minWidth: 800,
@@ -268,6 +337,13 @@ const createWindow = (): void => {
       path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
     );
   }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    if (cameraWindow && !cameraWindow.isDestroyed()) {
+      cameraWindow.close();
+    }
+  });
 };
 
 app.on('ready', createWindow);
