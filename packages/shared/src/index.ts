@@ -17,6 +17,9 @@ export {
   TABLET_COMMANDS_COLLECTION,
   TABLET_STREAM_COLLECTION,
   TABLET_CMD_FRESH_MS,
+  TABLET_PRESENCE_COLLECTION,
+  TABLET_PRESENCE_HEARTBEAT_MS,
+  TABLET_PRESENCE_STALE_MS,
   type FirebaseConfig,
 } from "./config";
 export {
@@ -75,6 +78,9 @@ export {
   stopTabletCamera,
   readTabletStreamState,
   isTabletCommandFresh,
+  readTabletPresence,
+  isTabletPresenceFresh,
   type TabletCameraMode,
   type TabletStreamState,
+  type TabletPresenceState,
 } from "./tablet";

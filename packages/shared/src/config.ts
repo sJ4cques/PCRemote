@@ -174,3 +174,31 @@ export const TABLET_STREAM_COLLECTION = "tablet_stream";
  * su vista sigue esperando.
  */
 export const TABLET_CMD_FRESH_MS = 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Presencia de la app Android (Modo Tablet)
+//
+// La app Android (SOLO mientras la pantalla "Modo Tablet" existe) publica su
+// estado en `tablet_presence/{hostId}`: `running` + `foreground` + un latido
+// (`updatedAt`). Escribe en cada transición de ciclo de vida (abre / pasa a
+// segundo plano / cierra) y actualiza el latido cada
+// `TABLET_PRESENCE_HEARTBEAT_MS` mientras el proceso vive.
+//
+// El cliente de escritorio NO sondea: solo lee el doc cuando el usuario
+// presiona el botón de la card. Un doc ausente o viejo significa "app cerrada".
+// Espejo conceptual de `presence/{machineId}` (host), pero en sentido inverso:
+// acá el Android escribe y el cliente lee.
+// ---------------------------------------------------------------------------
+
+/** Colección de presencia de la app Android en Modo Tablet. */
+export const TABLET_PRESENCE_COLLECTION = "tablet_presence";
+
+/** Cada cuánto la tablet refresca el latido mientras el proceso vive. */
+export const TABLET_PRESENCE_HEARTBEAT_MS = 60 * 1000;
+
+/**
+ * Si `updatedAt` es más viejo que esto, el cliente considera que la app
+ * no responde (cerrada o sin red). Es 2.5x el latido: aguanta un latido
+ * perdido sin parpadear.
+ */
+export const TABLET_PRESENCE_STALE_MS = 150 * 1000;

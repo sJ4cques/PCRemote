@@ -4,6 +4,8 @@ import {
   PC_COMMANDS_DOC_ID,
   TABLET_COMMANDS_COLLECTION,
   TABLET_CMD_FRESH_MS,
+  TABLET_PRESENCE_COLLECTION,
+  TABLET_PRESENCE_STALE_MS,
   TABLET_STREAM_COLLECTION,
 } from "./config";
 
@@ -116,4 +118,62 @@ export async function readTabletStreamState(
 /** `true` si un `timestamp` de comando todavía es atendible (no rancio). */
 export function isTabletCommandFresh(timestamp: number, nowMs: number = Date.now()): boolean {
   return timestamp > 0 && nowMs - timestamp <= TABLET_CMD_FRESH_MS;
+}
+
+/** Estado que la app Android publica en `tablet_presence/{hostId}`. */
+export interface TabletPresenceState {
+  /** El proceso de la pantalla Modo Tablet sigue vivo (no se cerró). */
+  running: boolean;
+  /** `true` = la pantalla Modo Tablet está en primer plano (activa). */
+  foreground: boolean;
+  /** Marca del último latido (ms epoch). */
+  updatedAt: number;
+  deviceName: string;
+  appVersion: string;
+  mode: string;
+}
+
+/**
+ * Lee `tablet_presence/{hostId}` para saber si la app Android (Modo Tablet)
+ * está abierta y si está en primer plano o en segundo plano. Es una lectura
+ * BAJO DEMANDA: se llama solo cuando el usuario lo pide, nunca en un loop.
+ *
+ * Devuelve `null` si el doc no existe (la app nunca se abrió en Modo Tablet,
+ * o se borró). Nunca lanza: cualquier error devuelve `null`.
+ */
+export async function readTabletPresence(
+  db: Firestore,
+  hostId: string,
+): Promise<TabletPresenceState | null> {
+  const id = hostId || PC_COMMANDS_DOC_ID;
+  try {
+    const snap = await getDoc(doc(db, TABLET_PRESENCE_COLLECTION, id));
+    if (!snap.exists()) {
+      return null;
+    }
+    const d = snap.data() as Record<string, unknown>;
+    const num = (v: unknown): number =>
+      typeof v === "number" ? v : Number(String(v ?? "0")) || 0;
+    const str = (v: unknown): string => (typeof v === "string" ? v : "");
+    const bool = (v: unknown): boolean => v === true || v === "true";
+    return {
+      running: bool(d.running),
+      foreground: bool(d.foreground),
+      updatedAt: num(d.updatedAt),
+      deviceName: str(d.deviceName),
+      appVersion: str(d.appVersion),
+      mode: str(d.mode),
+    };
+  } catch (err) {
+    console.error(`[tablet] readTabletPresence(${id}) falló:`, err);
+    return null;
+  }
+}
+
+/** `true` si el latido de presencia de la tablet sigue fresco. */
+export function isTabletPresenceFresh(
+  updatedAt: number,
+  nowMs: number = Date.now(),
+): boolean {
+  return updatedAt > 0 && nowMs - updatedAt <= TABLET_PRESENCE_STALE_MS;
 }

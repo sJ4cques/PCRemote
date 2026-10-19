@@ -84,6 +84,14 @@ service cloud.firestore {
       }
     }
 
+    // Presencia de la app Android en Modo Tablet. La tablet (cuenta de
+    // servicio, salta estas reglas) publica `running`/`foreground`/latido; el
+    // cliente de escritorio (SDK web anónimo) lo lee SOLO a pedido del usuario.
+    // Mismo modelo de confianza abierto que `presence`/`tablet_stream`.
+    match /tablet_presence/{hostId} {
+      allow read, write: if true;
+    }
+
     // Verificación de conectividad usada por `pingFirestore()`.
     match /_healthcheck/{doc} {
       allow read, write: if true;

@@ -10,6 +10,8 @@ import {
   isHostPoweredOn,
   presenceSummary,
   readHostPresence,
+  readTabletPresence,
+  isTabletPresenceFresh,
   readTabletStreamState,
   requestTabletCamera,
   sendWakeCommand,
@@ -22,6 +24,7 @@ import {
   type MouseButton,
   type PeerStatus,
   type TabletCameraMode,
+  type TabletPresenceState,
 } from '@isisanubis/shared';
 import type { SavedPair } from './global';
 
@@ -91,12 +94,53 @@ function presenceFor(snap: HostPresenceSnapshot | null): PairPresence {
   return { status: 'on', label: presenceSummary(snap) };
 }
 
+/** Estado de la app Android (Modo Tablet) que muestra la card al consultarlo. */
+type TabletAppCheck = {
+  status: 'checking' | 'active' | 'background' | 'closed' | 'stale' | 'error';
+  label: string;
+};
+
+/** Traduce la presencia publicada por la tablet a un estado de card. */
+function tabletAppCheckFor(snap: TabletPresenceState | null): TabletAppCheck {
+  if (snap === null) {
+    return { status: 'closed', label: 'App Android cerrada (nunca se abrió en Modo Tablet)' };
+  }
+  if (!isTabletPresenceFresh(snap.updatedAt)) {
+    return { status: 'stale', label: `App Android sin señal (${formatAge(Date.now() - snap.updatedAt)})` };
+  }
+  if (!snap.running) {
+    return { status: 'closed', label: 'App Android cerrada' };
+  }
+  const name = snap.deviceName ? `${snap.deviceName} · ` : '';
+  if (snap.foreground) {
+    return { status: 'active', label: `${name}activa en primer plano` };
+  }
+  return { status: 'background', label: `${name}en segundo plano` };
+}
+
+/** Edad legible y corta para el estado de la tablet. */
+function formatAge(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return 'sin sello';
+  }
+  const s = Math.round(ms / 1000);
+  if (s < 60) {
+    return `hace ${s}s`;
+  }
+  if (s < 3600) {
+    return `hace ${Math.round(s / 60)} min`;
+  }
+  return `hace ${Math.round(s / 3600)} h`;
+}
+
 const App: React.FC = () => {
   const [view, setView] = useState<'dashboard' | 'session'>('dashboard');
   const [sessionName, setSessionName] = useState('');
   const [pairs, setPairs] = useState<SavedPair[]>([]);
   /** Presencia pasiva del host por equipo emparejado (`presence/{hostId}`). */
   const [presences, setPresences] = useState<Record<string, PairPresence>>({});
+  /** Estado de la app Android (Modo Tablet) por equipo, tras consultarlo. */
+  const [tabletAppChecks, setTabletAppChecks] = useState<Record<string, TabletAppCheck>>({});
   /** Feedback del encendido WoL en la vista de sesión (overlay PC Offline). */
   const [sessionWakeMsg, setSessionWakeMsg] = useState('');
   /** Equipo cuyo botón "Apagar" está armado esperando confirmación (doble toque). */
@@ -300,6 +344,27 @@ const App: React.FC = () => {
     const timer = window.setInterval(() => void refreshPresences(), 30_000);
     return () => window.clearInterval(timer);
   }, [view, refreshPresences]);
+
+  /**
+   * Consulta BAJO DEMANDA el estado de la app Android (Modo Tablet) y lo
+   * refleja en la card. Nunca corre en loop: solo al presionar el botón, para
+   * no gastar lecturas.
+   */
+  const handleCheckTabletApp = useCallback(async (pair: SavedPair) => {
+    setTabletAppChecks((prev) => ({
+      ...prev,
+      [pair.id]: { status: 'checking', label: 'Consultando la app Android…' },
+    }));
+    try {
+      const snap = await readTabletPresence(getFirebaseDb(), pair.id);
+      setTabletAppChecks((prev) => ({ ...prev, [pair.id]: tabletAppCheckFor(snap) }));
+    } catch {
+      setTabletAppChecks((prev) => ({
+        ...prev,
+        [pair.id]: { status: 'error', label: 'No se pudo consultar (¿red o reglas?)' },
+      }));
+    }
+  }, []);
 
   /** Escribe el comando WoL que escucha la tableta y actualiza el feedback de
    *  la card. Queda una nota visible ~20 s y se re-chequea presencia para
@@ -1876,6 +1941,12 @@ const App: React.FC = () => {
                   </>
                 );
               })()}
+              {tabletAppChecks[pair.id] ? (
+                <span className={`pair-card-tablet ${tabletAppChecks[pair.id].status}`}>
+                  <span className="pair-presence-dot" aria-hidden="true" />
+                  <span className="pair-presence-text">{tabletAppChecks[pair.id].label}</span>
+                </span>
+              ) : null}
             </div>
             <div className="pair-card-actions">
               <button
@@ -1889,6 +1960,20 @@ const App: React.FC = () => {
               >
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
                   <path d="M13 2 4 14h6l-1 8L18 9h-6z" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="pair-action tablet-app"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleCheckTabletApp(pair);
+                }}
+                title="Comprobar si la app de la tablet está abierta (y si está en primer plano o en segundo plano)"
+              >
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <rect x="7" y="2.5" width="10" height="19" rx="2.2" />
+                  <path d="M11 18.5h2" />
                 </svg>
               </button>
               <button
