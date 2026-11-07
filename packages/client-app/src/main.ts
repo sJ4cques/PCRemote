@@ -254,6 +254,42 @@ const isisPairArgs = argValue('--isis-pair');
 // por IPC (el proceso main solo reenvía mensajes).
 // ---------------------------------------------------------------------------
 
+/** Cerrar una ventana mientras carga rechaza con ERR_ABORTED: no es un error. */
+function logLoadError(err: unknown): void {
+  console.warn('[client] loadURL/loadFile falló:', err);
+}
+
+/** Si el renderer se cae (GPU, OOM, crash nativo), recargamos en vez de dejar
+ *  una ventana en blanco sin salida. */
+function attachCrashRecovery(win: BrowserWindow, label: string): void {
+  // Máximo 3 recargas por minuto: evita un bucle si el crash es inmediato.
+  const crashes: number[] = [];
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error(`[client] renderer (${label}) terminado:`, details.reason);
+    if (details.reason === 'clean-exit' || win.isDestroyed()) {
+      return;
+    }
+    const now = Date.now();
+    while (crashes.length > 0 && now - crashes[0] > 60_000) {
+      crashes.shift();
+    }
+    crashes.push(now);
+    if (crashes.length > 3) {
+      console.error(`[client] renderer (${label}) se cae en bucle; no se recarga más`);
+      return;
+    }
+    setTimeout(() => {
+      if (!win.isDestroyed()) {
+        win.webContents.reload();
+      }
+    }, 1_000);
+  });
+}
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[client] promesa rechazada sin manejar:', reason);
+});
+
 function createCameraWindow(): void {
   if (cameraWindow && !cameraWindow.isDestroyed()) {
     cameraWindow.show();
@@ -277,17 +313,21 @@ function createCameraWindow(): void {
     },
   });
   cameraWindow.setAlwaysOnTop(true, 'floating');
+  attachCrashRecovery(cameraWindow, 'camera');
   cameraWindow.on('closed', () => {
     cameraWindow = null;
-    mainWindow?.webContents.send('isis:camera-window-closed');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('isis:camera-window-closed');
+    }
   });
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    void cameraWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}#camera-window`);
+    cameraWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}#camera-window`).catch(logLoadError);
   } else {
-    void cameraWindow.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-      { hash: 'camera-window' },
-    );
+    cameraWindow
+      .loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`), {
+        hash: 'camera-window',
+      })
+      .catch(logLoadError);
   }
 }
 
@@ -331,12 +371,13 @@ const createWindow = (): void => {
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    void mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+    mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL).catch(logLoadError);
   } else {
-    void mainWindow.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-    );
+    mainWindow
+      .loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`))
+      .catch(logLoadError);
   }
+  attachCrashRecovery(mainWindow, 'main');
 
   mainWindow.on('closed', () => {
     mainWindow = null;

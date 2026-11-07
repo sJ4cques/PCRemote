@@ -837,9 +837,32 @@ export class ClientPeer {
   }
 
   async start(): Promise<ClientPeerStartResult> {
+    try {
+      return await this.startInner();
+    } catch (err) {
+      // getDoc/sha256 pueden fallar (permission-denied, offline, red). Antes
+      // la promesa se rechazaba sin que nadie la atrapara y la UI quedaba en
+      // "looking_up" para siempre.
+      console.error(`[ClientPeer/${this.code}] start error:`, err);
+      if (this.stopped) {
+        return { ok: false, reason: "stopped" };
+      }
+      this.onStatus("error", "lookup_failed");
+      void this.stop("lookup_failed").catch(() => undefined);
+      return { ok: false, reason: "lookup_failed" };
+    }
+  }
+
+  private async startInner(): Promise<ClientPeerStartResult> {
     this.onStatus("looking_up", this.code);
 
     const snap = await getDoc(this.sessionRef);
+    // stop() pudo llegar mientras esperábamos: no crear nada (antes quedaba un
+    // RTCPeerConnection + listeners + timer huérfanos que además pisaban la
+    // oferta del intento nuevo).
+    if (this.stopped) {
+      return { ok: false, reason: "stopped" };
+    }
     if (!snap.exists()) {
       this.onStatus("error", "code_not_found");
       return { ok: false, reason: "code_not_found" };
@@ -863,6 +886,9 @@ export class ClientPeer {
         return { ok: false, reason: "pin_required" };
       }
       const hash = await sha256Hex(this.pin);
+      if (this.stopped) {
+        return { ok: false, reason: "stopped" };
+      }
       if (hash !== data.pinHash) {
         this.onStatus("error", "pin_wrong");
         return { ok: false, reason: "pin_wrong" };
@@ -933,11 +959,23 @@ export class ClientPeer {
       if (this.secret) {
         patch.token = await sha256Hex(this.secret);
       }
+      // No publicar la oferta de un intento ya cancelado: pisaría la del nuevo.
+      if (this.stopped) {
+        return { ok: false, reason: "stopped" };
+      }
       await updateDoc(this.sessionRef, patch);
     } catch (err) {
+      if (this.stopped) {
+        // stop() cerró el pc en medio de la negociación: no es un error.
+        return { ok: false, reason: "stopped" };
+      }
       console.error(`[ClientPeer/${this.code}] offer error:`, err);
       this.onStatus("error", "offer_failed");
+      void this.stop("offer_failed").catch(() => undefined);
       return { ok: false, reason: "offer_failed" };
+    }
+    if (this.stopped) {
+      return { ok: false, reason: "stopped" };
     }
 
     this.timer = setTimeout(() => {
@@ -1115,15 +1153,17 @@ export class ClientPeer {
       attemptId?: string;
     };
     if (data.answer && !this.answerReceived) {
-      this.answerReceived = true;
       // El host confirma el intento en curso. Solo lo adoptamos si coincide con
-      // el nuestro: si no, es la respuesta de una negociación vieja.
+      // el nuestro: si no, es la respuesta de una negociación vieja. Importante:
+      // `answerReceived` se marca DESPUÉS del chequeo; antes una respuesta vieja
+      // lo marcaba y la respuesta correcta se ignoraba hasta el timeout.
       if (data.attemptId && data.attemptId !== this.attemptId) {
         console.warn(
           `[ClientPeer/${this.code}] answer de otro intento (${data.attemptId} != ${this.attemptId}); ignorada`,
         );
         return;
       }
+      this.answerReceived = true;
       void this.setRemoteAnswer(data.answer);
     }
     if (data.status === "rejected") {

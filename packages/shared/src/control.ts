@@ -68,7 +68,20 @@ export function encodeDataChannelMessage(msg: DataChannelMessage): string {
 /** Decodifica una mensaje recibido por el DataChannel. Devuelve `null` si no es válido. */
 export function decodeDataChannelMessage(raw: unknown): DataChannelMessage | null {
   try {
-    return JSON.parse(String(raw)) as DataChannelMessage;
+    const parsed: unknown = JSON.parse(String(raw));
+    // Validación mínima de forma: un `{"kind":"control"}` sin payload (p. ej.
+    // desde la app Android) hacía fallar `msg.payload.kind` en los handlers.
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    const msg = parsed as { kind?: unknown; payload?: unknown };
+    if (typeof msg.kind !== "string") {
+      return null;
+    }
+    if (msg.kind === "control" && (!msg.payload || typeof msg.payload !== "object")) {
+      return null;
+    }
+    return parsed as DataChannelMessage;
   } catch {
     return null;
   }

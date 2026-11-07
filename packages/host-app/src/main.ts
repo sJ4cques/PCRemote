@@ -147,6 +147,12 @@ function appendLog(line: string): void {
   }
 }
 
+// Una promesa rechazada sin catch no debe pasar desapercibida (ni, en futuras
+// versiones de Electron/Node, tumbar el proceso main).
+process.on('unhandledRejection', (reason) => {
+  appendLog(`[host] promesa rechazada sin manejar: ${String(reason)}`);
+});
+
 // ---------------------------------------------------------------------------
 // Ventana, bandeja y ciclo de vida
 // ---------------------------------------------------------------------------
@@ -271,13 +277,36 @@ const createWindow = (): void => {
     mainWindow = null;
   });
 
+  // Cerrar la ventana mientras carga rechaza con ERR_ABORTED: no es un error.
+  const logLoadError = (err: unknown): void => appendLog(`[host] loadURL/loadFile falló: ${String(err)}`);
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    void win.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+    win.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL).catch(logLoadError);
   } else {
-    void win.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-    );
+    win
+      .loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`))
+      .catch(logLoadError);
   }
+  // Renderer caído (GPU/OOM) → recargar en vez de dejar la ventana en blanco.
+  // Máximo 3 recargas por minuto para no entrar en bucle.
+  const crashes: number[] = [];
+  win.webContents.on('render-process-gone', (_event, details) => {
+    appendLog(`[host] renderer terminado: ${details.reason}`);
+    if (details.reason === 'clean-exit' || win.isDestroyed()) {
+      return;
+    }
+    const now = Date.now();
+    while (crashes.length > 0 && now - crashes[0] > 60_000) {
+      crashes.shift();
+    }
+    crashes.push(now);
+    if (crashes.length <= 3) {
+      setTimeout(() => {
+        if (!win.isDestroyed()) {
+          win.webContents.reload();
+        }
+      }, 1_000);
+    }
+  });
 };
 
 const gotLock = isInputHelper || app.requestSingleInstanceLock();
@@ -1292,6 +1321,21 @@ ipcMain.handle('isis:regenerate-pairing', () => {
   cfg.hostId = randomKey(8);
   cfg.secret = randomKey(8);
   saveConfig(cfg);
+  // La presencia y la escucha de apagado siguen el hostId: sin reiniciarlas,
+  // un cliente emparejado con el id nuevo veía "absent" hasta reiniciar la app.
+  if (!isisHostId) {
+    try {
+      stopPresence();
+      startPresence(getFirebaseDb(), {
+        machineId: cfg.hostId,
+        hostId: cfg.hostId,
+        deviceName: cfg.deviceName,
+        log: appendLog,
+      });
+    } catch (err) {
+      appendLog(`[presence] no se pudo reiniciar tras regenerar: ${String(err)}`);
+    }
+  }
   return { hostId: cfg.hostId, secret: cfg.secret };
 });
 

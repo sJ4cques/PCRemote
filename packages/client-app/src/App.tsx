@@ -452,6 +452,17 @@ const App: React.FC = () => {
 
   /** Señalización del relay con la ventana separada (IPC, vía proceso main). */
   const handleCameraSignal = useCallback(async (data: unknown) => {
+    try {
+      await handleCameraSignalInner(data);
+    } catch (err) {
+      // Dos `ready` seguidos (StrictMode / recarga de la ventana) cierran el pc
+      // en medio de createOffer → InvalidStateError. Antes era un rechazo sin
+      // manejar; ahora se registra y la ventana puede volver a pedir `ready`.
+      console.warn('[camera relay] señal ignorada:', err);
+    }
+  }, []);
+
+  const handleCameraSignalInner = async (data: unknown): Promise<void> => {
     const msg = data as { type?: string; sdp?: string; candidate?: RTCIceCandidateInit };
     if (!msg?.type) {
       return;
@@ -489,13 +500,28 @@ const App: React.FC = () => {
         }
       };
       const offer = await pc.createOffer();
+      if (relayPcRef.current !== pc) {
+        return; // otro `ready` reemplazó este pc mientras esperábamos
+      }
       await pc.setLocalDescription(offer);
+      if (relayPcRef.current !== pc) {
+        return;
+      }
       window.isis?.cameraSend({ type: 'offer', sdp: offer.sdp });
     } else if (msg.type === 'answer' && relayPcRef.current) {
-      await relayPcRef.current.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+      const pc = relayPcRef.current;
+      // Un answer para una oferta ya reemplazada (o duplicado) lanza
+      // InvalidStateError: solo se aplica si el pc espera un answer.
+      if (pc.signalingState !== 'have-local-offer') {
+        return;
+      }
+      await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+      if (relayPcRef.current !== pc) {
+        return;
+      }
       for (const candidate of relayPendingRef.current) {
         try {
-          await relayPcRef.current.addIceCandidate(candidate);
+          await pc.addIceCandidate(candidate);
         } catch {
           // candidato obsoleto: se ignora
         }
@@ -516,7 +542,7 @@ const App: React.FC = () => {
         relayPendingRef.current.push(msg.candidate);
       }
     }
-  }, []);
+  };
 
   /**
    * Pide la cámara de la tablet emparejada y muestra su streaming.
@@ -547,6 +573,12 @@ const App: React.FC = () => {
       // separada: se respeta lo que el usuario ya eligió.
       tabletAutoOpenedRef.current = !autoOpen;
       const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    // Cambiar a otra tablet: apagar la cámara de la anterior (si no, su
+    // `tablet_commands` quedaba en cameraStream=true para siempre).
+    const prevPairId = tabletActivePairIdRef.current;
+    if (prevPairId && prevPairId !== pair.id) {
+      void stopTabletCamera(getFirebaseDb(), prevPairId).catch(() => undefined);
+    }
     tabletActivePairIdRef.current = pair.id;
     setTabletActivePairId(pair.id);
     setTabletCam({ pair, mode });
@@ -568,6 +600,25 @@ const App: React.FC = () => {
       }
     };
 
+    /** Fin definitivo del intento (error / timeout / caída): deja de re-enviar
+     *  el comando y apaga la cámara de la tablet. Antes el comando se seguía
+     *  repitiendo cada 15 s y la tablet reabría la cámara indefinidamente. */
+    const giveUp = (detail: string): void => {
+      if (stale()) {
+        return;
+      }
+      stopCommandTimer();
+      void stopTabletCamera(getFirebaseDb(), pair.id).catch(() => undefined);
+      setTabletStatus('error');
+      setTabletStatusDetail(detail);
+    };
+
+    /** Motivos transitorios (doc de una sesión anterior, carrera con la tablet)
+     *  que vale la pena reintentar unas pocas veces. */
+    const RETRYABLE = new Set(['code_not_found', 'session_closed', 'session_busy', 'offer_failed']);
+    const MAX_RETRIES = 3;
+    let retries = 0;
+
     /** Espera a que la tablet copie nuestro `requestId` al doc de streaming. */
     const waitForTabletReady = async (): Promise<boolean> => {
       const deadline = Date.now() + 120_000;
@@ -586,8 +637,10 @@ const App: React.FC = () => {
       return false;
     };
 
+    let everConnected = false;
+
     const negotiate = async (): Promise<void> => {
-      const peer = new ClientPeer({
+      const peer: ClientPeer = new ClientPeer({
         db: getFirebaseDb(),
         collection: TABLET_STREAM_COLLECTION,
         code: pair.id,
@@ -595,7 +648,26 @@ const App: React.FC = () => {
         secret: pair.secret,
         audio: false,
         onStatus: (s, d) => {
-          if (stale()) {
+          if (stale() || tabletPeerRef.current !== peer) {
+            return;
+          }
+          if (s === 'ended') {
+            if (d === 'stopped' || d === undefined) {
+              return;
+            }
+            // La sesión cayó sin llegar a conectar por un motivo transitorio:
+            // reintento corto con un peer nuevo.
+            if (!everConnected && d && RETRYABLE.has(d) && retries < MAX_RETRIES) {
+              retries += 1;
+              tabletPeerRef.current = null;
+              window.setTimeout(() => {
+                if (!stale()) {
+                  void negotiate();
+                }
+              }, 2_000);
+              return;
+            }
+            giveUp(ERROR_DETAIL[d] ?? d);
             return;
           }
           if (d === 'code_not_found') {
@@ -608,6 +680,7 @@ const App: React.FC = () => {
             setTabletStatusDetail(ERROR_DETAIL[d] ?? d);
           }
           if (s === 'connected') {
+            everConnected = true;
             stopCommandTimer();
             setTabletStatusDetail('Cámara de la tablet conectada');
           }
@@ -631,15 +704,19 @@ const App: React.FC = () => {
       if (stale()) {
         return;
       }
-      if (result.ok) {
+      if (result.ok || result.reason === 'stopped') {
         return;
       }
-      if (result.reason === 'code_not_found') {
-        // La tablet aún no creó el doc pese a haber confirmado: reintentar.
-        await peer.stop();
-        if (tabletPeerRef.current === peer) {
-          tabletPeerRef.current = null;
-        }
+      if (tabletPeerRef.current === peer) {
+        tabletPeerRef.current = null;
+      }
+      await peer.stop();
+      if (stale()) {
+        return;
+      }
+      if (result.reason && RETRYABLE.has(result.reason) && retries < MAX_RETRIES) {
+        // P. ej. la tablet aún no creó el doc pese a haber confirmado.
+        retries += 1;
         window.setTimeout(() => {
           if (!stale()) {
             void negotiate();
@@ -647,19 +724,23 @@ const App: React.FC = () => {
         }, 2_000);
         return;
       }
-      setTabletStatus('error');
-      setTabletStatusDetail(
-        ERROR_DETAIL[result.reason ?? ''] ?? result.reason ?? 'No se pudo iniciar la cámara',
-      );
+      giveUp(ERROR_DETAIL[result.reason ?? ''] ?? result.reason ?? 'No se pudo iniciar la cámara');
     };
 
     void (async () => {
       const ready = await waitForTabletReady();
-      if (stale() || !ready) {
+      if (stale()) {
+        return;
+      }
+      if (!ready) {
+        giveUp('La tablet no respondió. ¿Está abierta en Modo Tablet con la pantalla encendida?');
         return;
       }
       await negotiate();
-    })();
+    })().catch((err: unknown) => {
+      console.error('[tablet camera] error:', err);
+      giveUp('No se pudo iniciar la cámara de la tablet.');
+    });
   }, []);
 
   /** Mantiene el ref del stream actual y reemplaza el track del relay si cambió
@@ -707,7 +788,15 @@ const App: React.FC = () => {
         window.clearInterval(tabletCmdTimerRef.current);
         tabletCmdTimerRef.current = null;
       }
+      tabletGenerationRef.current += 1;
       void tabletPeerRef.current?.stop();
+      tabletPeerRef.current = null;
+      relayPcRef.current?.close();
+      relayPcRef.current = null;
+      const id = tabletActivePairIdRef.current;
+      if (id) {
+        void stopTabletCamera(getFirebaseDb(), id).catch(() => undefined);
+      }
     };
   }, []);
 
@@ -1945,6 +2034,14 @@ const App: React.FC = () => {
                 <span className={`pair-card-tablet ${tabletAppChecks[pair.id].status}`}>
                   <span className="pair-presence-dot" aria-hidden="true" />
                   <span className="pair-presence-text">{tabletAppChecks[pair.id].label}</span>
+                </span>
+              ) : null}
+              {tabletActivePairId === pair.id && tabletStatusDetail ? (
+                <span
+                  className={`pair-card-camera-status muted${tabletStatus === 'error' ? ' error' : ''}`}
+                  role="status"
+                >
+                  Cámara: {tabletStatusDetail}
                 </span>
               ) : null}
             </div>

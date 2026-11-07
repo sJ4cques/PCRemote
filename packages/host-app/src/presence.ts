@@ -88,6 +88,9 @@ type Running = {
   info: HostPresenceInfo;
   db: Firestore;
   stopped: boolean;
+  /** Handlers de powerMonitor, para quitarlos en `stopPresence` (si no, un
+   *  start/stop/start los duplicaba y cada evento escribía N veces). */
+  powerHandlers: Array<[string, () => void]>;
 };
 
 let running: Running | null = null;
@@ -466,6 +469,7 @@ export function startPresence(db: Firestore, info: HostPresenceInfo): void {
     info: { ...info, machineId },
     db,
     stopped: false,
+    powerHandlers: [],
   };
   const ctx = running;
   info.log(
@@ -474,11 +478,19 @@ export function startPresence(db: Firestore, info: HostPresenceInfo): void {
 
   // Publicación por eventos de powerMonitor. `shutdown` es el que tiene mejor
   // chance de llegar antes de que Windows corte la energía.
-  powerMonitor.on('suspend', () => void onPowerEvent('suspend', 'suspended'));
-  powerMonitor.on('resume', () => void onPowerEvent('resume', 'online'));
-  powerMonitor.on('lock-screen', () => void onPowerEvent('lock-screen', 'locked'));
-  powerMonitor.on('unlock-screen', () => void onPowerEvent('unlock-screen', 'online'));
-  powerMonitor.on('shutdown', () => void onPowerEvent('shutdown', 'offline'));
+  const logPowerError = (err: unknown): void => {
+    info.log(`[presence] error publicando evento: ${String(err)}`);
+  };
+  ctx.powerHandlers = [
+    ['suspend', () => void onPowerEvent('suspend', 'suspended').catch(logPowerError)],
+    ['resume', () => void onPowerEvent('resume', 'online').catch(logPowerError)],
+    ['lock-screen', () => void onPowerEvent('lock-screen', 'locked').catch(logPowerError)],
+    ['unlock-screen', () => void onPowerEvent('unlock-screen', 'online').catch(logPowerError)],
+    ['shutdown', () => void onPowerEvent('shutdown', 'offline').catch(logPowerError)],
+  ];
+  for (const [event, handler] of ctx.powerHandlers) {
+    powerMonitor.on(event as 'suspend', handler);
+  }
 
   ctx.unsubPending = onSnapshot(
     probeRef(db, machineId, PENDING_DOC),
@@ -495,13 +507,17 @@ export function startPresence(db: Firestore, info: HostPresenceInfo): void {
   // adentro es el mismo que dispara un evento de powerMonitor, así que si la
   // PC se bloqueó/suspendió el doc va a reflejarlo y no una mentira.
   ctx.heartbeatTimer = setInterval(() => {
-    void runHealthCheck().then((health) => publishState(stateFor(health), health));
+    void runHealthCheck()
+      .then((health) => publishState(stateFor(health), health))
+      .catch(logPowerError);
   }, PRESENCE_HEARTBEAT_MS);
 
   // Primer latido inmediato: no esperamos 5 minutos para que el teléfono vea
   // algo fresco al primer arranque. Equivale al publish que ya hacíamos en
   // arranque, ahora además deja `lastHeartbeatAt` poblado.
-  void runHealthCheck().then((health) => publishState(stateFor(health), health));
+  void runHealthCheck()
+    .then((health) => publishState(stateFor(health), health))
+    .catch(logPowerError);
 }
 
 /**
@@ -516,6 +532,10 @@ export function stopPresence(): void {
     return;
   }
   ctx.stopped = true;
+  for (const [event, handler] of ctx.powerHandlers) {
+    powerMonitor.removeListener(event as 'suspend', handler);
+  }
+  ctx.powerHandlers = [];
   if (ctx.heartbeatTimer !== null) {
     clearInterval(ctx.heartbeatTimer);
     ctx.heartbeatTimer = null;

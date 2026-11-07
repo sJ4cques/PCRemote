@@ -73,8 +73,21 @@ const CameraWindow: React.FC = () => {
       }
     }
 
+    // Las señales se procesan EN ORDEN (cola de promesas): dos ofertas
+    // superpuestas intercalaban setRemoteDescription/setLocalDescription y
+    // lanzaban InvalidStateError sin manejar.
+    let queue: Promise<void> = Promise.resolve();
     const off = window.isis?.onCameraSignal((data) => {
-      void handleSignal(data as SignalMessage);
+      queue = queue
+        .then(async () => {
+          if (pc.signalingState === 'closed') {
+            return;
+          }
+          await handleSignal(data as SignalMessage);
+        })
+        .catch((err: unknown) => {
+          console.warn('[camera window] señal ignorada:', err);
+        });
     });
 
     // Avisa a la ventana principal que estamos listos para recibir la oferta.
